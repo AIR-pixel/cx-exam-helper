@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.air.exammock"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <application android:label="Exam Mock"
+                 android:allowBackup="false"
+                 android:usesCleartextTraffic="true">
+
+        <activity android:name=".MockExam"
+                  android:exported="true"
+                  android:theme="@android:style/Theme.Material.Light"
+                  android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

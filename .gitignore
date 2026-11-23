@@ -1,0 +1,24 @@
+# ===== 构建产物 =====
+**/build/
+**/classes/
+**/gen/
+*.apk
+*.idsig
+*.dex
+*.flata
+
+# ===== 运行时/临时 =====
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# ===== 搭配截图/视频（根目录散件，evidence/ 精选另行保留）=====
+*.mp4
+
+# ===== 凭据/密钥 =====
+*.keystore
+
+# ===== 系统 =====
+Thumbs.db
+.DS_Store

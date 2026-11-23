@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.air.skipmodule"
+    android:versionCode="3"
+    android:versionName="1.2">
+    <application android:label="SkipModule" android:allowBackup="false">
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Set SKIP_SCREENSHOT on answer app windows" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.air.mpprobe" />
+        <!-- 唯一作用是让包被启动一次，清掉 FLAG_STOPPED；见 Main.java 注释 -->
+        <activity android:name=".Main" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
