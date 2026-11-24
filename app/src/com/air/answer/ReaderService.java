@@ -352,12 +352,13 @@ public class ReaderService extends AccessibilityService {
 
     private void handleText(final String text) {
         final String q = text;
+        final String structured = readStructured();
         Log.d(TAG, "READ " + text.length() + " chars:\n"
                 + (text.length() > 1500 ? text.substring(0, 1500) + "…" : text));
         inFlight = true;
         new Thread(new Runnable() { public void run() {
             try {
-                Answer a = askPC(q);
+                Answer a = askPC(q, null, structured);
                 if (a == null) return;
                 // 去重键优先用 stableKey（题干+选项哈希，滚动不变），
                 // 没有时才退回整屏 screenHash（老版 PC 服务兼容）。
@@ -399,11 +400,16 @@ public class ReaderService extends AccessibilityService {
     }
 
     private Answer askPC(String question) {
-        return askPC(question, null);
+        return askPC(question, null, "");
     }
 
     /** 带图片题 OCR 的上送：image 为 base64 PNG，可为 null */
     private Answer askPC(String question, String image) {
+        return askPC(question, image, "");
+    }
+
+    /** 完整上送：question=整屏文本兜底，image=OCR图，structured=区域抽取JSON */
+    private Answer askPC(String question, String image, String structured) {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(ENDPOINT).openConnection();
@@ -418,6 +424,11 @@ public class ReaderService extends AccessibilityService {
             body.put("question", question);
             body.put("pkg", "com.air.mpprobe");
             if (image != null && !image.isEmpty()) body.put("image", image);
+            if (structured != null && !structured.isEmpty()) {
+                // 区域抽取结果：JSON 对象字符串，PC 端优先用它（不再猜题干/选项）
+                try { body.put("structured", new JSONObject(structured)); }
+                catch (Throwable ignored) { body.put("structured", structured); }
+            }
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(body.toString().getBytes(StandardCharsets.UTF_8));
             }
@@ -493,6 +504,117 @@ public class ReaderService extends AccessibilityService {
 
         int cnt = Math.min(n.getChildCount(), 300);
         for (int i = 0; i < cnt; i++) walk(n.getChild(i), sb, seen, depth + 1);
+    }
+
+    // ─────────────────── 区域抽取（题干/选项/题型按 a11y 层级分离）───────────────────
+
+    /** 一个可见文本节点及其屏幕位置 */
+    private static final class TextNode {
+        final String text;
+        final int top, bottom, left;
+        TextNode(String text, int top, int bottom, int left) {
+            this.text = text; this.top = top; this.bottom = bottom; this.left = left;
+        }
+    }
+
+    /**
+     * 读取带位置的文本节点，按 y 排序后分区域。
+     * 学习通/考试页的 WebView 会把每个 div 映射成独立 TextView 并带精确 bounds，
+     * 据此区分「题干 / 选项 / 题型 / UI 噪声」，不再靠整屏文本猜。
+     * @return JSON 字符串 {stem, options:[...], typeLabel}；失败返回 ""
+     */
+    private String readStructured() {
+        java.util.List<TextNode> nodes = new java.util.ArrayList<>();
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        try {
+            for (android.view.accessibility.AccessibilityWindowInfo w : getWindows()) {
+                if (w == null || w.getType() != android.view.accessibility.AccessibilityWindowInfo
+                        .TYPE_APPLICATION) continue;
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r != null) collectNodes(r, nodes, seen, 0);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "readStructured getWindows failed", t);
+        }
+        if (nodes.isEmpty()) return "";
+        java.util.Collections.sort(nodes, new java.util.Comparator<TextNode>() {
+            public int compare(TextNode a, TextNode b) { return a.top - b.top; }
+        });
+        return groupNodes(nodes);
+    }
+
+    private void collectNodes(AccessibilityNodeInfo n, java.util.List<TextNode> out,
+                              java.util.Set<String> seen, int depth) {
+        if (n == null || depth > 40 || !n.isVisibleToUser()) return;
+        CharSequence t = n.getText();
+        String s = t != null ? t.toString().trim() : "";
+        if (!s.isEmpty() && seen.add(s)) {
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            out.add(new TextNode(s, r.top, r.bottom, r.left));
+        }
+        int cnt = Math.min(n.getChildCount(), 300);
+        for (int i = 0; i < cnt; i++) collectNodes(n.getChild(i), out, seen, depth + 1);
+    }
+
+    /** 按 y 坐标 + 文本特征分成题干/选项/题型 */
+    private String groupNodes(java.util.List<TextNode> nodes) {
+        java.util.List<String> options = new java.util.ArrayList<>();
+        String stem = "", typeLabel = "";
+        int stemTop = -1, firstOptTop = -1;
+
+        // 1. 题型标签：独立成行的「单选题/多选题/判断题/填空题/简答题」
+        String[] TYPES = {"单选题", "多选题", "判断题", "填空题", "简答题", "名词解释", "论述题"};
+        for (TextNode n : nodes) {
+            for (String ty : TYPES) {
+                if (n.text.equals(ty)) { typeLabel = ty; break; }
+            }
+            if (!typeLabel.isEmpty()) break;
+        }
+
+        // 2. 选项：匹配 A. / A、/ A) 开头的行，记录首选项 y
+        java.util.regex.Pattern optRe = java.util.regex.Pattern.compile("^\\s*[A-J][.、)）]\\s*\\S.*");
+        for (TextNode n : nodes) {
+            if (optRe.matcher(n.text).matches()) {
+                options.add(n.text);
+                if (firstOptTop < 0) firstOptTop = n.top;
+            }
+        }
+
+        // 3. 题干：在题型标签之后、第一个选项之前的较长文本
+        //    剔除 UI 噪声（倒计时/工具栏/按钮/题号分值单独行）
+        for (TextNode n : nodes) {
+            if (firstOptTop > 0 && n.top >= firstOptTop) continue;   // 选项区及以后
+            if (n.text.length() < 8) continue;                        // 太短（题号/分值/题型）
+            if (isChromeText(n.text)) continue;
+            // 取最靠下的一条较长文本作为题干（题干通常在选项紧上方）
+            if (stem.isEmpty() || n.top > stemTop) { stem = n.text; stemTop = n.top; }
+        }
+
+        if (stem.isEmpty() && options.isEmpty()) return "";
+        try {
+            JSONObject j = new JSONObject();
+            j.put("stem", stem);
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (String o : options) arr.put(o);
+            j.put("options", arr);
+            j.put("typeLabel", typeLabel);
+            Log.d(TAG, "STRUCT stem=" + stem + " opts=" + options.size() + " type=" + typeLabel);
+            return j.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** UI 装饰文字（题型/工具栏/倒计时/按钮）——不作为题干 */
+    private static boolean isChromeText(String s) {
+        if (s == null) return true;
+        String t = s.trim();
+        if (t.contains("剩余时间") || t.contains("倒计时")) return true;
+        if (t.contains("答题卡") || t.contains("上一题") || t.contains("下一题")) return true;
+        if (t.contains("保存") && t.contains("提交")) return true;
+        if (t.equals("Exam Mock") || t.equals("下一题 / NEXT")) return true;
+        return false;
     }
 
     @Override public void onInterrupt() {

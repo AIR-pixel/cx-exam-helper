@@ -27,3 +27,5 @@ manager-test.err
 # ===== 绯荤粺 =====
 Thumbs.db
 .DS_Store
+# 外部下载的模块包/临时缓存
+.cache/

@@ -33,7 +33,7 @@
  */
 
 import http from 'node:http';
-import { parseScreen, parseAnswerText, countBlanks } from './answer-core.mjs';
+import { parseScreen, parseStructured, parseAnswerText, countBlanks } from './answer-core.mjs';
 import { AnswerCache } from './answer-cache.mjs';
 import { qoderAvailable, qoderChat, qoderModels } from './engine-qoder.mjs';
 
@@ -229,8 +229,16 @@ async function ocrImage(base64) {
 /**
  * 一条 a11y 文本 → 答案
  */
-async function solve(text) {
-  const structured = parseScreen(text);
+async function solve(text, preStructured) {
+  // 手机端 a11y 区域抽取优先；没有或解析失败才退回整屏文本解析
+  let structured;
+  if (preStructured && (preStructured.stem || (preStructured.options || []).length)) {
+    structured = parseStructured(preStructured);
+    console.log(`[structured] stem="${String(structured.primary?.stem || '').slice(0, 40)}" `
+      + `opts=${structured.primary?.options?.length || 0} type=${structured.primary?.type || '-'}`);
+  } else {
+    structured = parseScreen(text);
+  }
 
   if (!structured.ok) {
     return {
@@ -354,10 +362,12 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       let text = '';
       let image = '';
+      let structured = null;
       try {
         const j = JSON.parse(body);
         text = j.question || '';
         image = j.image || '';
+        structured = j.structured || null;
       } catch { text = body; }
       const t0 = Date.now();
       // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
@@ -365,7 +375,7 @@ const server = http.createServer(async (req, res) => {
         const ocrText = await ocrImage(image);
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
-      const r = await solve(text);
+      const r = await solve(text, structured);
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`);
       return json(res, {
         answer: r.answer,

@@ -367,6 +367,42 @@ export function parseScreen(text, opts = {}) {
   };
 }
 
+/**
+ * 手机端 a11y 区域抽取结果 → 结构化结果。
+ * 题干/选项/题型已在手机端按节点 bounds 分好，这里不再靠整屏文本猜，
+ * 只做轻量归一化 + 题型判定 + 计算 stableKey。
+ * @param {{stem:string, options:string[], typeLabel:string}} s
+ * @returns {object} 与 parseScreen 同形状
+ */
+export function parseStructured(s) {
+  // 剥题号/分值/题型前缀，和整屏路径 cleanLines 保持一致
+  const stem = stripPrefix(normalizeLine(s?.stem || ''));
+  const rawOpts = Array.isArray(s?.options) ? s.options : [];
+  const options = rawOpts.map((o) => {
+    const m = String(o).trim().match(/^([A-J])[.、)）]\s*(.*)$/);
+    return m ? { key: m[1], text: m[2].trim() } : { key: '', text: String(o).trim() };
+  }).filter((o) => o.text);
+  const typeLabel = String(s?.typeLabel || '').trim();
+
+  const q = { stem, options };
+  if (typeLabel) q.typeLabel = typeLabel;
+  q.type = detectType(q);
+  if (q.type === 'blank') q.blankCount = countBlanks(stem);
+
+  const screenHash = createHash('sha1').update(stem + '|' + options.map((o) => o.text).join('\n'))
+    .digest('hex').slice(0, 16);
+  const stableKey = normalizeForHash(q);
+  return {
+    ok: !!stem || options.length > 0,
+    mode: 'structured',
+    questions: [q],
+    primary: q,
+    screenHash,
+    stableKey,
+    lineCount: 1 + options.length,
+  };
+}
+
 // ─────────────────────────── 去重键 ───────────────────────────
 
 /** 归一化题目 → 稳定哈希（题干去标点空白 + 选项排序） */

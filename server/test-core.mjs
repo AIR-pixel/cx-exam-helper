@@ -5,7 +5,7 @@
  */
 import {
   normalizeLine, isNoise, cleanLines, matchOption, detectType, countBlanks,
-  parseScreen, normalizeForHash, extractJson, lettersToIndices, parseAnswerText,
+  parseScreen, parseStructured, normalizeForHash, extractJson, lettersToIndices, parseAnswerText,
   stripPrefix,
 } from './answer-core.mjs';
 
@@ -289,6 +289,35 @@ eq('空文本', parseScreen('').questions, []);
 eq('null 文本', parseScreen(null).questions, []);
 eq('纯噪音文本', parseScreen('标记\n答题卡\n3.').questions, []);
 eq('超长文本不炸', (() => { try { parseScreen('长'.repeat(50000)); return 'ok'; } catch (e) { return 'throw'; } })(), 'ok');
+
+// ══════════════ 14. 区域抽取（手机端按 a11y bounds 分好） ══════════════
+{
+  const s = parseStructured({
+    stem: '1.（2分）下列关于 TCP 三次握手的描述，正确的是：',
+    options: ['A. 第一次握手由客户端发送 SYN 报文', 'B. 第二次握手由服务端发送 SYN 报文',
+              'C. 第三次握手由服务端发送 ACK 报文', 'D. 三次握手一共需要四个报文段'],
+    typeLabel: '单选题',
+  });
+  eq('结构化 ok', s.ok, true);
+  eq('结构化 mode', s.mode, 'structured');
+  eq('结构化题干去题号分值', s.primary.stem, '下列关于 TCP 三次握手的描述,正确的是:');
+  eq('结构化选项数', s.primary.options.length, 4);
+  eq('结构化首选项文本', s.primary.options[0].text, '第一次握手由客户端发送 SYN 报文');
+  eq('结构化题型', s.primary.type, 'single');
+  ok('结构化 stableKey 32位', /^[0-9a-f]{32}$/.test(s.stableKey), s.stableKey);
+
+  // 判断题无选项
+  const j = parseStructured({ stem: 'HTTPS 在 TCP 之上加入 TLS。', options: ['A. 对', 'B. 错'], typeLabel: '判断题' });
+  eq('结构化判断题', j.primary.type, 'judge');
+
+  // 填空
+  const b = parseStructured({ stem: 'TCP 首部固定长度是____字节。', options: [], typeLabel: '填空题' });
+  eq('结构化填空', b.primary.type, 'blank');
+
+  // 空输入不炸
+  eq('结构化空输入', parseStructured({}).ok, false);
+  eq('结构化 null', parseStructured(null).ok, false);
+}
 
 // ══════════════ 报告 ══════════════
 console.log(`\n${'='.repeat(60)}`);

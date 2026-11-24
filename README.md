@@ -88,6 +88,25 @@
 
 > OCR 依赖：`pip install rapidocr_onnxruntime`（已在本机 Python 3.13 验证）。
 
+### 区域抽取 + root 隐藏（2026-11-24）
+
+**④ 区域抽取**：手机端 `ReaderService.readStructured()` 按 a11y 节点的屏幕 bounds
+把 WebView 里的文本分成「题干 / 选项 / 题型」，随 `/answer` 的 `structured` 字段上送；
+PC 端 `answer-core.parseStructured()` 优先用它，不再靠整屏文本猜题干。
+整屏文本链路保留为兜底（学习通 DOM 结构不同而抽取失败时自动退回）。
+MockExam 三题型实测：单选 opts=4 / 多选 opts=4 / 判断 opts=2，题型标签全部正确。
+
+**⑥ root 隐藏**（针对学习通）：
+- Magisk DenyList 加入 `com.chaoxing.mobile`（含子进程），关闭系统的 denylist enforcement
+  （`disable_denylist=1`），由 Shamiko 接管；
+- 装 Shamiko 1.2.5（`zygisk_shamiko` 模块，构建在 ZygiskNext 之上）；
+- 已验证共存：Shamiko 装完重启后 LSPosed 的 VolKey hook 仍正常加载，
+  答案 app 的 a11y 链路不依赖注入学习通，因此 DenyList 隐藏学习通不影响答题方案。
+- 设备已具备 PIF + TrickyStore + HideMyApplist，环境检测基础完整。
+- ⚠️ **最终有效性需真实学习通考试页验证**（解锁 + 登录后看是否弹 root 风险提示）——
+  设备当前停在需 PIN 的锁屏，无法自动完成这一步。
+- 相关脚本：`scripts/denylist-setup.sh` / `shamiko-setup.sh` / `shamiko-verify.sh` / `coexist-verify.sh`。
+
 ### 快速跑（PC 端 · 纯命令行）
 
 ```bash
