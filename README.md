@@ -74,8 +74,6 @@
 | `app/src/com/air/answer/ConfigStore.java` | 服务地址持久化 |
 | `app/src/com/air/answer/ToggleReceiver.java` | 音量键广播接收器 |
 | `app/src/com/air/answer/FloatService.java` | 前台服务保活 |
-| `app/src/com/air/answer/TextExtract.java` | a11y 文本线性化 |
-| `app/src/com/air/answer/StructExtract.java` | 结构化抽取（题干/选项/题型） |
 | `xposed/VolKeyModule.java` | 音量键双击（hook `system_server`） |
 | `xposed/SkipModule.java` | `SKIP_SCREENSHOT`（hook `ViewRootImpl#setView`） |
 
