@@ -62,6 +62,27 @@
 
 > 手机侧仍需 `adb reverse tcp:18888 tcp:18888`（每次重启后重建）。
 
+### 三项读题增强（2026-11-24）
+
+1. **题号锚点去重**：PC 返回 `stableKey`（题干+选项哈希，不受滚动/可见节点变化影响），
+   手机端优先用它替代整屏 `screenHash` 去重。同时清洗倒计时/状态栏时间/OCR 置信度噪声行，
+   解决"拖长题目被误判成换题"的问题。实测 5 次内容变化只触发一次 `skip same question`。
+
+2. **双开关（浮层 / 总开关）**：`ToggleStore` 持久化两个独立开关到 SharedPreferences +
+   `/data/data/com.air.mpprobe/files/{overlay,app}.flag`（root 脚本可写）：
+   - 弹窗开关：只隐藏浮层，读题/作答继续
+   - 总开关：停掉整条读题链路并隐藏浮层
+   - **切换方式**：a11y `onKeyEvent` 双击 Vol+ / Vol-（原生 Android 有效）。
+     ⚠️ HyperOS/MIUI 实测不向无障碍服务派发按键，此路在该 ROM 上不生效，
+     需改用 Xposed hook 按键分发或 flag 文件脚本（见下）。
+
+3. **图片题 OCR 兜底**：a11y 重试耗尽仍读不到时，root `screencap` → base64 → `POST /answer{image}`
+   → PC 端 Python RapidOCR（`server/ocr_server.py`，`127.0.0.1:18890`）识别成文字进同一条解析管线。
+   实测端到端 2.9s 返回答案。开启方式：先 `python server/ocr_server.py`，
+   answer-server 通过 `OCR_URL` 环境变量找它（默认 `http://127.0.0.1:18890/ocr`，设为空关闭）。
+
+> OCR 依赖：`pip install rapidocr_onnxruntime`（已在本机 Python 3.13 验证）。
+
 ### 快速跑（PC 端 · 纯命令行）
 
 ```bash

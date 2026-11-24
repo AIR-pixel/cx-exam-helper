@@ -37,6 +37,13 @@ public class ReaderService extends AccessibilityService {
     private static final int MAX_ATTEMPTS = 6;
     private static final int RETRY_STEP_MS = 400;
 
+    // 音量键双击开关
+    private static final long DOUBLE_TAP_MS = 500;   // 两次短按间隔上限
+    private static final long TAP_COOLDOWN_MS = 600; // 触发后静默，防连发
+    private long lastVolUpDownAt = 0;
+    private long lastVolDownDownAt = 0;
+    private long lastToggleAt = 0;
+
     private final Handler h = new Handler(Looper.getMainLooper());
     private Runnable pending;
     private String lastScreenHash = "";
@@ -49,27 +56,84 @@ public class ReaderService extends AccessibilityService {
         super.onServiceConnected();
         Log.d(TAG, "connected");
 
+        // 必须显式声明接收按键事件：a11y_config XML 里写 flagRequestFilterKeyEvents
+        // 在部分 aapt2 版本上编不进去（实测 capabilities 仍为 1），代码里再补一刀。
+        android.accessibilityservice.AccessibilityServiceInfo info = getServiceInfo();
+        if (info != null) {
+            info.flags |= android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+            setServiceInfo(info);
+            Log.d(TAG, "key filter flags=" + info.flags);
+        }
+
+        ToggleStore.init(this);
         overlay = new AnswerOverlay(this);
         busListener = new Bus.Listener() {
             public void onUpdate(Bus.Msg m) {
-                if (overlay != null) overlay.render(m);
+                // 浮层开关关着时只更新 Bus（配置页还能看），不画浮层
+                if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.render(m);
             }
             public void onStatus(String text, String kind) {
-                if (overlay != null) overlay.status(text, kind);
+                if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.status(text, kind);
             }
         };
         Bus.setListener(busListener);
-        overlay.show();
-        Bus.publishStatus("a11y 已连接，等待题目…", "ready");
+        if (ToggleStore.appOn() && ToggleStore.overlayOn()) overlay.show();
+        Bus.publishStatus("a11y 已连接 · Vol+×2 弹窗 / Vol-×2 总开关", "ready");
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {
         if (e == null) return;
+        // 总开关关着时，整条读题链路停摆
+        if (!ToggleStore.appOn()) return;
         int t = e.getEventType();
         if (t != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
                 && t != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 && t != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return;
         scheduleScan();
+    }
+
+    /**
+     * 音量键双击开关（替代 root daemon 方案：a11y 直接收按键，零额外进程）。
+     *   Vol+ 双击 → 切浮层显隐（读题/作答继续）
+     *   Vol- 双击 → 切总开关（读题/浮层全停）
+     * 单击不拦截，正常调音量；双击窗口 500ms，触发后静默 600ms。
+     */
+    @Override public boolean onKeyEvent(android.view.KeyEvent e) {
+        if (e == null) return false;
+        int code = e.getKeyCode();
+        if (code != android.view.KeyEvent.KEYCODE_VOLUME_UP
+                && code != android.view.KeyEvent.KEYCODE_VOLUME_DOWN) return false;
+        // 只认按下，忽略抬起/长按重复
+        if (e.getAction() != android.view.KeyEvent.ACTION_DOWN || e.getRepeatCount() > 0) return false;
+
+        long now = System.currentTimeMillis();
+        if (now - lastToggleAt < TAP_COOLDOWN_MS) return false;
+
+        long[] last = code == android.view.KeyEvent.KEYCODE_VOLUME_UP
+                ? new long[]{lastVolUpDownAt} : new long[]{lastVolDownDownAt};
+        boolean isDouble = now - last[0] <= DOUBLE_TAP_MS;
+        if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) lastVolUpDownAt = now;
+        else lastVolDownDownAt = now;
+        if (!isDouble) return false;
+
+        lastToggleAt = now;
+        if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
+            boolean on = ToggleStore.toggleOverlay();
+            if (overlay != null) {
+                if (on && ToggleStore.appOn()) overlay.show(); else overlay.hide();
+            }
+            Bus.publishStatus("弹窗已" + (on ? "打开" : "关闭") + "（双击 Vol+ 切换）", "toggle");
+            Log.d(TAG, "KEY toggle overlay=" + on);
+        } else {
+            boolean on = ToggleStore.toggleApp();
+            if (overlay != null) {
+                if (on && ToggleStore.overlayOn()) overlay.show(); else overlay.hide();
+            }
+            Bus.publishStatus(on ? "应用已开启" : "应用已暂停（双击 Vol- 恢复）", "toggle");
+            Log.d(TAG, "KEY toggle app=" + on);
+        }
+        // 返回 false：不吞键，音量照常变化（避免"按键坏了"的错觉）
+        return false;
     }
 
     private void scheduleScan() {
@@ -108,6 +172,8 @@ public class ReaderService extends AccessibilityService {
         if (!usable) {
             Log.d(TAG, "give up after " + n + " attempts, last="
                     + text.replace('\n', '|'));
+            // 图片题兜底：a11y 读不到文字 → root screencap → PC OCR
+            if (ToggleStore.appOn()) handleWithOcr(text);
             return;
         }
         handleText(text);
@@ -220,6 +286,65 @@ public class ReaderService extends AccessibilityService {
         return sb.toString().trim();
     }
 
+    /**
+     * 图片题兜底：root 截屏 → base64 → POST /answer{question,image}。
+     * 只截一次（防抖由 scheduleScan 保证），OCR 在 PC 端做。
+     */
+    private void handleWithOcr(final String a11yText) {
+        if (inFlight) return;
+        inFlight = true;
+        new Thread(new Runnable() { public void run() {
+            try {
+                String img = captureScreenBase64();
+                if (img == null || img.isEmpty()) {
+                    Log.w(TAG, "OCR fallback: screencap failed");
+                    Bus.publishStatus("图片题：截屏失败（需 root）", "error");
+                    return;
+                }
+                Log.d(TAG, "OCR fallback: sending " + (img.length() / 1024) + "KB image");
+                Answer a = askPC(a11yText == null ? "" : a11yText, img);
+                if (a == null) return;
+                String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
+                if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
+                    Log.d(TAG, "OCR fallback skip same question " + dedupKey);
+                    return;
+                }
+                lastScreenHash = dedupKey;
+                Log.d(TAG, "OCR answer src=" + a.source + " type=" + a.type + " => " + a.text);
+                Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
+            } finally {
+                inFlight = false;
+            }
+        } }).start();
+    }
+
+    /** root screencap → PNG → base64（约 0.3~1s） */
+    private static String captureScreenBase64() {
+        String pngPath = "/data/local/tmp/ansreader-ocr.png";
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{
+                    "su", "-c", "screencap -p " + pngPath + " && chmod 666 " + pngPath});
+            p.waitFor();
+            java.io.File f = new java.io.File(pngPath);
+            if (!f.exists() || f.length() <= 0) return null;
+            byte[] b = new byte[(int) f.length()];
+            java.io.FileInputStream fis = new java.io.FileInputStream(f);
+            try {
+                int off = 0;
+                while (off < b.length) {
+                    int r = fis.read(b, off, b.length - off);
+                    if (r < 0) break;
+                    off += r;
+                }
+            } finally { fis.close(); }
+            f.delete();
+            return android.util.Base64.encodeToString(b, android.util.Base64.NO_WRAP);
+        } catch (Throwable t) {
+            Log.w(TAG, "captureScreenBase64 failed", t);
+            return null;
+        }
+    }
+
     private void handleText(final String text) {
         final String q = text;
         Log.d(TAG, "READ " + text.length() + " chars:\n"
@@ -229,11 +354,14 @@ public class ReaderService extends AccessibilityService {
             try {
                 Answer a = askPC(q);
                 if (a == null) return;
-                if (!a.screenHash.isEmpty() && a.screenHash.equals(lastScreenHash)) {
-                    Log.d(TAG, "skip same screen " + a.screenHash);
+                // 去重键优先用 stableKey（题干+选项哈希，滚动不变），
+                // 没有时才退回整屏 screenHash（老版 PC 服务兼容）。
+                String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
+                if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
+                    Log.d(TAG, "skip same question " + dedupKey);
                     return;
                 }
-                lastScreenHash = a.screenHash;
+                lastScreenHash = dedupKey;
                 Log.d(TAG, "answer src=" + a.source + " type=" + a.type
                         + " ms=" + a.ms + " => " + a.text);
                 Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
@@ -261,10 +389,16 @@ public class ReaderService extends AccessibilityService {
         String source = "unknown";
         String type = "";
         String screenHash = "";
+        String stableKey = "";  // 题干+选项的稳定哈希，滚动/可见性变化不影响
         long ms = 0;
     }
 
     private Answer askPC(String question) {
+        return askPC(question, null);
+    }
+
+    /** 带图片题 OCR 的上送：image 为 base64 PNG，可为 null */
+    private Answer askPC(String question, String image) {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(ENDPOINT).openConnection();
@@ -272,11 +406,13 @@ public class ReaderService extends AccessibilityService {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setDoOutput(true);
             conn.setConnectTimeout(3000);
-            conn.setReadTimeout(30000);
+            // OCR 可能耗时几秒，给足读超时
+            conn.setReadTimeout(image == null ? 30000 : 45000);
 
             JSONObject body = new JSONObject();
             body.put("question", question);
             body.put("pkg", "com.air.mpprobe");
+            if (image != null && !image.isEmpty()) body.put("image", image);
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(body.toString().getBytes(StandardCharsets.UTF_8));
             }
@@ -318,6 +454,7 @@ public class ReaderService extends AccessibilityService {
             a.source = j.optString("source", "unknown");
             a.type = j.optString("type", "");
             a.screenHash = j.optString("screenHash", "");
+            a.stableKey = j.optString("stableKey", "");
             a.ms = j.optLong("ms", 0);
             JSONObject qj = j.optJSONObject("question");
             if (qj != null) {

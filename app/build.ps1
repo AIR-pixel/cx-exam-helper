@@ -1,4 +1,4 @@
-# 构建 answer-app + exam-mock
+﻿# 构建 answer-app + exam-mock
 #
 # 用法（PowerShell，工作目录任意）：
 #   pwsh -File build.ps1

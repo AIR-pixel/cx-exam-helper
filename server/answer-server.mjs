@@ -40,6 +40,8 @@ import { qoderAvailable, qoderChat, qoderModels } from './engine-qoder.mjs';
 const PORT = Number(process.env.ANSWER_PORT || 18888);
 const CACHE_PATH = process.env.ANSWER_CACHE === '' ? ':memory:'
   : (process.env.ANSWER_CACHE || './answer-cache.db');
+// 图片题 OCR：Python RapidOCR 微服务地址，空字符串 = 关闭
+const OCR_URL = process.env.OCR_URL || 'http://127.0.0.1:18890/ocr';
 
 // ─────────────────────────── 缓存 ───────────────────────────
 let cache = null;
@@ -199,6 +201,32 @@ function renderAnswer(ans, q) {
 }
 
 /**
+ * 图片题兜底：把手机传来的 base64 截图交给 Python OCR 服务识别成文字。
+ * @returns {Promise<string>} 识别出的整屏文字；失败返回空串
+ */
+async function ocrImage(base64) {
+  if (!OCR_URL || !base64) return '';
+  try {
+    const res = await fetch(OCR_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ image: base64 }),
+      signal: AbortSignal.timeout(Number(process.env.OCR_TIMEOUT_MS || 20000)),
+    });
+    const j = await res.json();
+    if (!j.ok || !j.text) {
+      console.warn(`[ocr] failed: ${j.error || 'empty'}`);
+      return '';
+    }
+    console.log(`[ocr] ${j.count} lines, ${j.text.length} chars`);
+    return j.text;
+  } catch (e) {
+    console.warn(`[ocr] unavailable: ${e.message}`);
+    return '';
+  }
+}
+
+/**
  * 一条 a11y 文本 → 答案
  */
 async function solve(text) {
@@ -325,8 +353,18 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (url.pathname === '/answer' || url.pathname === '/')) {
       const body = await readBody(req);
       let text = '';
-      try { text = JSON.parse(body).question || ''; } catch { text = body; }
+      let image = '';
+      try {
+        const j = JSON.parse(body);
+        text = j.question || '';
+        image = j.image || '';
+      } catch { text = body; }
       const t0 = Date.now();
+      // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
+      if (image) {
+        const ocrText = await ocrImage(image);
+        if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
+      }
       const r = await solve(text);
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`);
       return json(res, {
@@ -335,6 +373,9 @@ const server = http.createServer(async (req, res) => {
         type: r.question?.type || null,
         question: r.question,
         screenHash: r.structured.screenHash,
+        // 稳定题目标识：题干+选项哈希，滚动/可见节点变化不影响它。
+        // 手机端优先用它去重，避免拖动长题干时被误判成换题。
+        stableKey: r.structured.stableKey || '',
         ms: Date.now() - t0,
       });
     }

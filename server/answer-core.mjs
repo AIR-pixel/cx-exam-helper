@@ -42,6 +42,12 @@ const UI_CHROME = new Set([
 
 const SEPARATORS = /^[\s\-—–_=*·•|/\\]+$/;
 
+// 倒计时类行带动态数字（"剩余时间 12:34"），UI_CHROME 精确匹配不到。
+// 这些行每秒变化，若留在题干里会让 stableKey 跟着变 → 滚动/倒计时误判成换题。
+const DYNAMIC_CHROME = /^(剩余时间|倒计时|时间|考试用时)[:：\s]*[\d:：分秒]/;
+// OCR 会把状态栏裸时间（"10:35"）和置信度碎片（"0.94"）读进来，也滤掉
+const OCR_NOISE = /^\d{1,2}:\d{2}(:\d{2})?$|^\d\.\d{2}$/;
+
 // ── 行首前缀：题号 / 分值 / 题型标签（可连续叠加，如 "3.（2分）单选题"）──
 const TYPE_WORDS = '单选题|多选题|判断题|填空题|简答题|名词解释|论述题|计算题|分析题|综合题|完形填空|阅读理解|连线题|排序题|听力题|材料题|共用选项题|不定项选择题';
 
@@ -125,6 +131,7 @@ export function isNoise(line) {
   if (!line) return true;
   if (SEPARATORS.test(line)) return true;
   if (UI_CHROME.has(line)) return true;
+  if (DYNAMIC_CHROME.test(line) || OCR_NOISE.test(line)) return true;
   for (const re of NOISE_RES) if (re.test(line)) return true;
   // 整行只是题号/分值/题型标签的叠加 → 装饰
   if (stripPrefix(line) === '') return true;
@@ -149,7 +156,7 @@ export function cleanLines(text, opts = {}) {
   for (const rawLine of String(text == null ? '' : text).split(/\r?\n/)) {
     let line = normalizeLine(rawLine);
     if (!line) continue;
-    if (UI_CHROME.has(line) || SEPARATORS.test(line)) continue;
+    if (UI_CHROME.has(line) || SEPARATORS.test(line) || DYNAMIC_CHROME.test(line) || OCR_NOISE.test(line)) continue;
 
     // 先剥前缀，再判噪音；纯前缀行剥完为空即丢，但题型标签要留下来
     const stripped = stripPrefixDetailed(line);
@@ -337,7 +344,7 @@ function splitQuestions(lines, typeLabels = new Map()) {
  * 整屏文本 → 结构化结果
  * @param {string} text a11y 拼出来的整屏文字
  * @param {{mode?:string}} [opts]
- * @returns {{ok:boolean, mode:string, questions:Array, primary:object|null, screenHash:string}}
+ * @returns {{ok:boolean, mode:string, questions:Array, primary:object|null, screenHash:string, stableKey:string}}
  */
 export function parseScreen(text, opts = {}) {
   const { lines, typeLabels } = cleanLines(text, { withTypes: true });
@@ -346,12 +353,16 @@ export function parseScreen(text, opts = {}) {
     .update(lines.join('\n'))
     .digest('hex')
     .slice(0, 16);
+  // stableKey：题干+选项的稳定哈希，不受滚动/可见节点变化影响。
+  // 手机端用它判断"是不是同一道题"，替代整屏 screenHash。
+  const stableKey = questions.length ? normalizeForHash(questions[0]) : '';
   return {
     ok: questions.length > 0,
     mode: opts.mode || 'unknown',
     questions,
     primary: questions[0] || null,
     screenHash,
+    stableKey,
     lineCount: lines.length,
   };
 }
