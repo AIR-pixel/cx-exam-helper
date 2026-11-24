@@ -72,9 +72,14 @@
    `/data/data/com.air.mpprobe/files/{overlay,app}.flag`（root 脚本可写）：
    - 弹窗开关：只隐藏浮层，读题/作答继续
    - 总开关：停掉整条读题链路并隐藏浮层
-   - **切换方式**：a11y `onKeyEvent` 双击 Vol+ / Vol-（原生 Android 有效）。
-     ⚠️ HyperOS/MIUI 实测不向无障碍服务派发按键，此路在该 ROM 上不生效，
-     需改用 Xposed hook 按键分发或 flag 文件脚本（见下）。
+   - **切换方式（已实现，真机验证）**：LSPosed 模块 `xposed/VolKeyModule.java` hook
+     `system_server` 的 `PhoneWindowManager.interceptKeyBeforeQueueing`，双击音量键时
+     发广播给 `ToggleReceiver`。**双击 Vol+ = 浮层开关，双击 Vol- = 总开关**。
+     - 为什么不用 a11y `onKeyEvent`：实测 HyperOS 不向无障碍服务派发按键，`getevent`/
+       `sendevent` 也抓不到（事件被 system_server 消费），只有 hook 按键分发层可靠。
+     - 部署：模块的 LSPosed scope **必须包含 `system`**（不是 `android`），且改完要重启；
+       重装模块后 apk_path 会变，需用 `scripts/fix_scope.py` + `putdb.sh` 修 LSPosed DB。
+     - 实测日志：`[VolKey] double UP → broadcast sent: overlay → AnsToggle: overlay -> false`。
 
 3. **图片题 OCR 兜底**：a11y 重试耗尽仍读不到时，root `screencap` → base64 → `POST /answer{image}`
    → PC 端 Python RapidOCR（`server/ocr_server.py`，`127.0.0.1:18890`）识别成文字进同一条解析管线。

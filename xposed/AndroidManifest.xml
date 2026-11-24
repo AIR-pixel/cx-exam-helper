@@ -1,21 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.air.skipmodule"
-    android:versionCode="3"
-    android:versionName="1.2">
+    android:versionCode="4"
+    android:versionName="1.3">
     <application android:label="SkipModule" android:allowBackup="false">
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Set SKIP_SCREENSHOT on answer app windows" />
+            android:value="SKIP_SCREENSHOT on answer app + volume-key double-tap toggles (Vol+=overlay, Vol-=app)" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
         <meta-data
             android:name="xposedscope"
-            android:value="com.air.mpprobe" />
+            android:value="com.air.mpprobe;system" />
         <!-- 唯一作用是让包被启动一次，清掉 FLAG_STOPPED；见 Main.java 注释 -->
         <activity android:name=".Main" android:exported="true">
             <intent-filter>

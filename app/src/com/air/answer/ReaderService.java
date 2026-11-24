@@ -73,6 +73,11 @@ public class ReaderService extends AccessibilityService {
                 if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.render(m);
             }
             public void onStatus(String text, String kind) {
+                // 开关切换（来自音量键/Xposed 广播）时同步浮层显隐
+                if ("toggle".equals(kind) && overlay != null) {
+                    if (ToggleStore.appOn() && ToggleStore.overlayOn()) overlay.show();
+                    else overlay.hide();
+                }
                 if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.status(text, kind);
             }
         };

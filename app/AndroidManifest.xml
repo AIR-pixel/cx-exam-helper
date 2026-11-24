@@ -27,6 +27,13 @@
                  android:exported="false"
                  android:foregroundServiceType="specialUse"/>
 
+        <!-- Xposed 模块（system_server）双击音量键发来的开关切换指令 -->
+        <receiver android:name=".ToggleReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.air.mpprobe.TOGGLE"/>
+            </intent-filter>
+        </receiver>
+
         <service android:name=".ReaderService"
                  android:exported="true"
                  android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
