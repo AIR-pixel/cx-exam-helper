@@ -29,28 +29,42 @@ public final class ToggleStore {
     private static final String SP_NAME = "toggle";
     private static final String K_OVERLAY = "overlayOn";
     private static final String K_APP = "appOn";
+    private static final String K_TREEDUMP = "treeDumpOn";
     private static final String FLAG_DIR = "/data/data/com.air.mpprobe/files";
 
     private static SharedPreferences sp;
     private static volatile boolean overlayOn = true;
     private static volatile boolean appOn = true;
+    private static volatile boolean treeDumpOn = false;
 
     public static void init(Context c) {
         if (sp != null) return;
         sp = c.getApplicationContext().getSharedPreferences(SP_NAME, Context.MODE_PRIVATE);
         overlayOn = sp.getBoolean(K_OVERLAY, true);
         appOn = sp.getBoolean(K_APP, true);
+        treeDumpOn = sp.getBoolean(K_TREEDUMP, false);
         // 若 flag 文件存在，以文件为准（方便 root 脚本预设开机状态）
         Boolean o = readFlag("overlay.flag");
         Boolean a = readFlag("app.flag");
+        Boolean d = readFlag("treedump.flag");
         if (o != null) overlayOn = o;
         if (a != null) appOn = a;
+        if (d != null) treeDumpOn = d;
         writeAll();
-        Log.d(TAG, "init overlay=" + overlayOn + " app=" + appOn);
+        Log.d(TAG, "init overlay=" + overlayOn + " app=" + appOn + " treeDump=" + treeDumpOn);
     }
 
     public static boolean overlayOn() { return overlayOn; }
     public static boolean appOn() { return appOn; }
+    /** 诊断开关：图片题拿不到 targetUrl 时打开，把整棵 a11y 树打进日志 */
+    public static boolean treeDumpOn() { return treeDumpOn; }
+
+    public static boolean toggleTreeDump() {
+        treeDumpOn = !treeDumpOn;
+        persist();
+        Log.d(TAG, "treeDump -> " + treeDumpOn);
+        return treeDumpOn;
+    }
 
     public static boolean toggleOverlay() {
         overlayOn = !overlayOn;
@@ -67,13 +81,18 @@ public final class ToggleStore {
     }
 
     private static void persist() {
-        if (sp != null) sp.edit().putBoolean(K_OVERLAY, overlayOn).putBoolean(K_APP, appOn).apply();
+        if (sp != null) sp.edit()
+                .putBoolean(K_OVERLAY, overlayOn)
+                .putBoolean(K_APP, appOn)
+                .putBoolean(K_TREEDUMP, treeDumpOn)
+                .apply();
         writeAll();
     }
 
     private static void writeAll() {
         writeFlag("overlay.flag", overlayOn);
         writeFlag("app.flag", appOn);
+        writeFlag("treedump.flag", treeDumpOn);
     }
 
     private static Boolean readFlag(String name) {

@@ -68,6 +68,8 @@ public final class AnswerOverlay {
     // ─────────────────────── 挂载 ───────────────────────
 
     public void show() {
+        // 配置页在前台时不显示：叠层层级高于普通 Activity，会盖住自己的 UI。
+        if (Bus.suppressOverlay()) return;
         h.post(new Runnable() { public void run() {
             showInner();
             // 重新挂载后把当前答案填回去（hide→show 之间 Bus 里的值可能已经更新）

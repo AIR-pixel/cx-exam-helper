@@ -204,11 +204,90 @@ function renderAnswer(ans, q) {
 }
 
 /**
- * 图片题兜底：把手机传来的 base64 截图交给 Python OCR 服务识别成文字。
+ * 把手机传来的 image 字段归一成「OCR 服务能吃的 base64」。
+ *
+ * 手机端有两条路送图：
+ *   1. 截屏：直接给 base64（PNG）
+ *   2. a11y 的 targetUrl：给 data:... 或 http(s)://...
+ *      —— 实测 <img> 节点的 extras 里有 AccessibilityNodeInfo.targetUrl，
+ *         跟网页端脚本读 DOM 的 img.src 是同一份信息，比截屏干净得多。
+ *
+ * @returns {Promise<string>} base64；拿不到返回空串
+ */
+async function imageToBase64(image) {
+  if (!image) return '';
+  const s = String(image).trim();
+
+  // data:image/svg+xml;charset=utf-8,%3Csvg... 或 data:image/png;base64,xxx
+  if (s.startsWith('data:')) {
+    const comma = s.indexOf(',');
+    if (comma < 0) return '';
+    const meta = s.slice(5, comma);          // image/svg+xml;charset=utf-8 或 image/png;base64
+    const payload = s.slice(comma + 1);
+    if (/;base64/i.test(meta)) return payload;
+    // 非 base64 的 data URI：内容是 URL 编码的文本（SVG 常见）
+    const decoded = decodeURIComponent(payload);
+    const mime = meta.split(';')[0] || 'image/svg+xml';
+    console.log(`[image] data URI ${mime}, ${decoded.length} chars decoded`);
+    // SVG 走文本提取，不需要 OCR
+    if (mime.includes('svg')) return `__SVG__${decoded}`;
+    return Buffer.from(decoded, 'binary').toString('base64');
+  }
+
+  if (/^https?:\/\//i.test(s)) {
+    try {
+      const r = await fetch(s, { signal: AbortSignal.timeout(15000) });
+      if (!r.ok) { console.warn(`[image] http ${r.status} ${s.slice(0, 80)}`); return ''; }
+      const buf = Buffer.from(await r.arrayBuffer());
+      console.log(`[image] downloaded ${buf.length} bytes from ${s.slice(0, 80)}`);
+      return buf.toString('base64');
+    } catch (e) {
+      console.warn(`[image] download failed: ${e.message}`);
+      return '';
+    }
+  }
+
+  // 已经是 base64
+  return s;
+}
+
+/**
+ * 从 SVG 源码里抽文字。
+ *
+ * 实测 mock 的图片题用 <text> 画题干，a11y 的 targetUrl 是 data:image/svg+xml
+ * 形式的完整源码。这种情况根本不用 OCR —— 直接读 <text> 内容，
+ * 零误差、零耗时，比截屏 + RapidOCR 强一个量级。
+ * 真实学习通的题干图多为 PNG/JPEG，走不到这条分支。
+ */
+function textFromSvg(svg) {
+  const out = [];
+  const re = /<text[^>]*>([\s\S]*?)<\/text>/gi;
+  let m;
+  while ((m = re.exec(svg)) !== null) {
+    const t = m[1]
+      .replace(/<[^>]+>/g, '')          // 去掉嵌套标签
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .trim();
+    if (t) out.push(t);
+  }
+  if (out.length) console.log(`[image] svg text: ${out.length} lines, ${out.join(' ').length} chars`);
+  return out.join('\n');
+}
+
+/**
+ * 图片题兜底：把图片交给 Python OCR 服务识别成文字。
  * @returns {Promise<string>} 识别出的整屏文字；失败返回空串
  */
-async function ocrImage(base64) {
-  if (!OCR_URL || !base64) return '';
+async function ocrImage(image) {
+  const base64 = await imageToBase64(image);
+  if (!base64) return '';
+
+  // SVG 直接抽 <text>，不用 OCR
+  if (base64.startsWith('__SVG__')) return textFromSvg(base64.slice(7));
+
+  if (!OCR_URL) return '';
   try {
     const res = await fetch(OCR_URL, {
       method: 'POST',
@@ -468,11 +547,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, BIND, () => {
-  console.log(`Answer server v2.1 on ${BIND}:${PORT}`);
-  console.log(`  engine = ${engineMode}${engineReq !== engineMode ? ` (requested ${engineReq})` : ''}`);
-  console.log(`  cache  = ${cache ? cache.path : 'disabled'}`);
-});
+// 测试钩子：单测 import 这个模块时不要真起服务（会占端口、进程也不退出）。
+// 用 ANSWER_NO_LISTEN=1 跳过 listen，只导出纯函数。
+export const __test_imageToBase64 = imageToBase64;
+export const __test_textFromSvg = textFromSvg;
+export const __test_cleanOcrText = cleanOcrText;
+
+if (process.env.ANSWER_NO_LISTEN !== '1') {
+  server.listen(PORT, BIND, () => {
+    console.log(`Answer server v2.1 on ${BIND}:${PORT}`);
+    console.log(`  engine = ${engineMode}${engineReq !== engineMode ? ` (requested ${engineReq})` : ''}`);
+    console.log(`  cache  = ${cache ? cache.path : 'disabled'}`);
+  });
+}
 
 // 优雅退出，保证 sqlite 句柄释放
 for (const sig of ['SIGINT', 'SIGTERM']) {

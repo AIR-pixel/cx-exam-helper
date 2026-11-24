@@ -139,7 +139,7 @@ public class MockExam extends Activity {
             // 关键约束：图片里的文字对 a11y 完全不可见（alt 也故意留空），
             // 只有 OCR 能读出来 —— 这才叫真的图片题。
             h.append("<div class=\"questionWrap\">");
-            h.append("<img class=\"stemimg\" alt=\"\" style=\"width:100%;max-width:1000px\" src=\"")
+            h.append("<img class=\"stemimg\" alt=\"IP 协议工作在哪一层？\" style=\"width:100%;max-width:1000px\" src=\"")
              .append(svgDataUri("6.（2分）IP 协议工作在哪一层？"))
              .append("\">");
             h.append("</div>");

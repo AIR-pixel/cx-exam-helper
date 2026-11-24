@@ -78,6 +78,34 @@ public class ReaderService extends AccessibilityService {
     private String lastOcrA11yText = "";
 
     private AnswerOverlay overlay;
+    /** 静态引用，供 Main 配置页在 onResume 时直接撤掉叠层 */
+    private static volatile AnswerOverlay sOverlay;
+    /** 静态引用，供 Main 调 disableSelf() 真正注销无障碍 */
+    private static volatile ReaderService sInstance;
+
+    /** 配置页用：立即撤掉已挂载的叠层（叠层层级高于普通 Activity，会盖住自己的 UI） */
+    public static void hideOverlayNow() {
+        AnswerOverlay o = sOverlay;
+        if (o != null) o.hide();
+    }
+
+    /**
+     * 配置页用：真正注销无障碍服务。
+     *
+     * 不能用 Settings.Secure.putString 改 ENABLED_ACCESSIBILITY_SERVICES——
+     * 那是 WRITE_SECURE_SETTINGS 权限，普通应用写会静默失败（实测进程退了、
+     * 注册还在，系统随时会把服务拉回来）。
+     * AccessibilityService.disableSelf() 是服务自己的 API，不需要任何权限。
+     */
+    public static void disableSelfNow() {
+        ReaderService s = sInstance;
+        if (s == null) return;
+        try {
+            s.disableSelf();
+        } catch (Throwable t) {
+            android.util.Log.w("ReaderService", "disableSelf: " + t);
+        }
+    }
     private Bus.Listener busListener;
 
     @Override public void onServiceConnected() {
@@ -96,6 +124,8 @@ public class ReaderService extends AccessibilityService {
         ToggleStore.init(this);
         ConfigStore.init(this);
         overlay = new AnswerOverlay(this);
+        sOverlay = overlay;
+        sInstance = this;
         busListener = new Bus.Listener() {
             public void onUpdate(Bus.Msg m) {
                 // 浮层开关关着时只更新 Bus（配置页还能看），不画浮层
@@ -302,6 +332,24 @@ public class ReaderService extends AccessibilityService {
         // 有选项但没题干 → 图片题，走 OCR 而不是让模型猜选项
         if (imageStem && ToggleStore.appOn()) {
             Log.d(TAG, "image question: options without stem, use OCR");
+            // URL 优先：a11y 的 Image 节点 extras 里有 targetUrl，能直接拿图，
+            // 比截屏 OCR 精确（没有状态栏噪声、没有缩放失真）。
+            String imgUrl = firstImageUrl();
+            if (!imgUrl.isEmpty()) {
+                Log.d(TAG, "image url found: " + (imgUrl.length() > 80 ? imgUrl.substring(0, 80) + "…" : imgUrl));
+                handleWithImageUrl(text, imgUrl);
+                return;
+            }
+            Log.d(TAG, "no image url in a11y tree, fallback to screenshot OCR");
+            // 诊断开关：排查真学习通拿不到 targetUrl 时打开，看 a11y 树里到底有什么。
+            // 默认关闭——整棵树 dump 有几十行，每道图片题都打会把日志淹掉。
+            if (ToggleStore.treeDumpOn()) {
+                try {
+                    Log.d(TAG, "TREE-DUMP-BEGIN\n" + TreeDump.dump(this) + "TREE-DUMP-END");
+                } catch (Throwable t) {
+                    Log.w(TAG, "tree dump failed: " + t);
+                }
+            }
             handleWithOcr(text);
             return;
         }
@@ -458,6 +506,79 @@ public class ReaderService extends AccessibilityService {
      * 图片题兜底：root 截屏 → base64 → POST /answer{question,image}。
      * 只截一次（防抖由 scheduleScan 保证），OCR 在 PC 端做。
      */
+    /**
+     * 从当前窗口的 a11y 树里找题干图片的 URL。
+     *
+     * 实测（Android 17 / WebView）：<img> 对应的节点是 className=Image，
+     * extras 里有 "AccessibilityNodeInfo.targetUrl" = 图片地址，
+     * 还有 unclippedWidth/Height 给出原始尺寸。
+     * 这跟网页端脚本读 DOM 的 img.src 是同一份信息，只是通道不同。
+     *
+     * 选哪一个：只取主窗口（type=1）里宽度最大的那个 —— 题干图通常占满一行，
+     * 状态栏/图标类的 width 都很小，会被 ImageNodes 内部过滤掉。
+     */
+    private String firstImageUrl() {
+        try {
+            java.util.List<android.view.accessibility.AccessibilityWindowInfo> wins = getWindows();
+            if (wins == null) return "";
+            String best = "";
+            int bestW = 0;
+            for (android.view.accessibility.AccessibilityWindowInfo w : wins) {
+                // 只看应用窗口，跳过状态栏(3)/输入法(2)/系统窗口
+                if (w.getType() != android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                android.view.accessibility.AccessibilityNodeInfo root = w.getRoot();
+                if (root == null) continue;
+                for (ImageNodes.Shot s : ImageNodes.collect(root)) {
+                    if (s.url == null || s.url.isEmpty()) continue;
+                    if (!s.url.startsWith("data:") && !s.url.startsWith("http")) continue;
+                    if (s.width > bestW) { bestW = s.width; best = s.url; }
+                }
+            }
+            return best;
+        } catch (Throwable t) {
+            Log.w(TAG, "firstImageUrl: " + t);
+            return "";
+        }
+    }
+
+    /**
+     * 用图片 URL 解题（比截屏 OCR 精确）。
+     *
+     * 和 handleWithOcr 的区别：
+     *   · 不截屏、不 hide 叠层 → 没有闪烁，没有状态栏噪声，没有缩放失真
+     *   · data: URI 直接把原图交给服务端解码；http(s) 交给服务端下载
+     *   · 服务端走同一条 imageStem 分支，OCR/解码结果接管题干
+     */
+    private void handleWithImageUrl(final String a11yText, final String url) {
+        if (inFlight) { deferredScan = true; return; }
+        inFlight = true;
+        new Thread(new Runnable() { public void run() {
+            try {
+                String struct = readStructured();
+                // 直接把 URL 当 image 字段上送；服务端能识别 data:/http 前缀
+                Answer a = askPC(a11yText == null ? "" : a11yText, url,
+                        struct == null ? "" : struct);
+                if (a == null) return;
+                if ("none".equals(a.source)) {
+                    Log.d(TAG, "image url: server says not a question, drop");
+                    Bus.publishStatus("未识别到题目", "off");
+                    return;
+                }
+                String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
+                if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
+                    Log.d(TAG, "image url skip same question " + dedupKey);
+                    return;
+                }
+                lastScreenHash = dedupKey;
+                Log.d(TAG, "image-url answer src=" + a.source + " type=" + a.type + " => " + a.text);
+                Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
+            } finally {
+                inFlight = false;
+                flushDeferredScan();
+            }
+        } }, "imgurl").start();
+    }
+
     private void handleWithOcr(final String a11yText) {
         if (inFlight) return;
         // 同一屏不重复截屏 OCR。

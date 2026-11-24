@@ -55,6 +55,17 @@ public final class Bus {
     public static String status() { return status; }
     public static String statusKind() { return statusKind; }
 
+    /**
+     * 抑制叠层显示（配置页在前台时用）。
+     *
+     * 叠层是 TYPE_ACCESSIBILITY_OVERLAY，层级高于普通 Activity，
+     * 打开自己的配置页时会被它盖住。这里给一个全局开关，
+     * ReaderService 在展示/刷新叠层前检查。
+     */
+    private static volatile boolean suppressOverlay = false;
+    public static boolean suppressOverlay() { return suppressOverlay; }
+    public static void setSuppressOverlay(boolean v) { suppressOverlay = v; }
+
     /** 一条答案到达（带题目原文 + 来源 + 题型） */
     public static void publishV2(String question, String answer, String source, String type, long ms) {
         Msg m = new Msg(question, answer, source, type, ms);
