@@ -25,40 +25,52 @@ public class TreeDump {
         if (wins == null) return sb.toString();
 
         for (AccessibilityWindowInfo w : wins) {
-            AccessibilityNodeInfo root = w.getRoot();
-            if (root == null) continue;
-            sb.append("--- window type=").append(w.getType())
-              .append(" layer=").append(w.getLayer())
-              .append(" ---\n");
-            walk(root, sb, 0);
+            AccessibilityNodeInfo root = null;
+            try {
+                root = w.getRoot();
+                if (root == null) continue;
+                sb.append("--- window type=").append(w.getType())
+                  .append(" layer=").append(w.getLayer())
+                  .append(" ---\n");
+                walk(root, sb, 0);
+            } finally {
+                if (root != null) {
+                    try { root.recycle(); } catch (Throwable ignored) { }
+                }
+            }
         }
         return sb.toString();
     }
 
     private static void walk(AccessibilityNodeInfo n, StringBuilder sb, int depth) {
         if (n == null || depth > 40) return;
-        String cls = String.valueOf(n.getClassName());
+        CharSequence cs = n.getClassName();
+        String cls = cs == null ? "" : cs.toString();
         String text = n.getText() == null ? "" : n.getText().toString();
         String desc = n.getContentDescription() == null ? "" : n.getContentDescription().toString();
         String hint = "";
         try { hint = n.getHintText() == null ? "" : n.getHintText().toString(); } catch (Throwable ignored) { }
 
-        // 只打有信息量的：有文本 / 有描述 / 有提示 / 是 ImageView / 有 viewId
+        boolean isImage = cls.endsWith(".widget.Image") || cls.contains("ImageView");
+
+        // 只打有信息量的：有文本 / 有描述 / 有提示 / 是图片 / 是 WebView / 有 img 类 viewId
         boolean interesting = !text.isEmpty() || !desc.isEmpty() || !hint.isEmpty()
-                || cls.contains("Image") || cls.contains("WebView")
+                || isImage || cls.contains("WebView")
                 || (n.getViewIdResourceName() != null && n.getViewIdResourceName().contains("img"));
 
         if (interesting) {
             sb.append("  ".repeat(Math.min(depth, 20)));
+            // 无包名的类（"android.view.View" 之外还有空串）会算出 -1+1=0，substring 正常；
+            // 但 cls 为空串时 lastIndexOf 返回 -1，+1 = 0，结果还是空串，安全。
             sb.append(cls.substring(cls.lastIndexOf('.') + 1));
             if (!text.isEmpty()) sb.append(" text=[").append(cut(text)).append(']');
             if (!desc.isEmpty()) sb.append(" desc=[").append(cut(desc)).append(']');
             if (!hint.isEmpty()) sb.append(" hint=[").append(cut(hint)).append(']');
             String vid = n.getViewIdResourceName();
             if (vid != null) sb.append(" id=").append(vid);
-            if (cls.contains("Image")) sb.append(" <<IMAGE>>");
+            if (isImage) sb.append(" <<IMAGE>>");
             // 图片节点把能拿到的元信息全倒出来：src 到底有没有留在某处？
-            if (cls.contains("Image")) {
+            if (isImage) {
                 android.os.Bundle ex = n.getExtras();
                 if (ex != null && !ex.isEmpty()) {
                     sb.append(" extras={");
@@ -74,8 +86,16 @@ public class TreeDump {
 
         int cnt = n.getChildCount();
         for (int i = 0; i < cnt; i++) {
-            AccessibilityNodeInfo c = n.getChild(i);
-            if (c != null) walk(c, sb, depth + 1);
+            AccessibilityNodeInfo c = null;
+            try {
+                c = n.getChild(i);
+                if (c != null) walk(c, sb, depth + 1);
+            } catch (Throwable ignored) {
+            } finally {
+                if (c != null) {
+                    try { c.recycle(); } catch (Throwable ignored) { }
+                }
+            }
         }
     }
 

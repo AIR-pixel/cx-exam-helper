@@ -186,10 +186,65 @@ function textFromSvg(svg) {
 网页端脚本还能顺手读 `input[name=answer]`、`<div class="questionId">` 这类隐藏字段，
 a11y 完全看不到。这是两条路的固有差距，不是实现问题。
 
+## Review 阶段发现并修掉的问题
+
+首版跑通后做了一轮针对性 review，6 个问题：
+
+### 1. 重复请求：同一张图 10 秒发了 5 次（性能，实际浪费）
+
+`handleWithOcr` 有发送前去重，`handleWithImageUrl` 漏了。轮询每 2.5s 一跳，
+每次都把同一张图重发，只有等服务端返回后才发现 `stableKey` 重复。
+
+```
+修前：image url found 5 次 / skip same question 4 次 → 4 次请求白烧
+修后：image url found 7 次 / skip same url 6 次    → 只 1 次真请求
+```
+
+修法：加 `lastImageUrl` 字段，发送前比对 URL。
+
+### 2. a11y 节点没 recycle（内存，长期轮询会累积）
+
+`getRoot()` / `getChild()` 返回的 `AccessibilityNodeInfo` 由调用方负责回收。
+不回收，节点池会被撑爆。轮询每 2.5s 遍历一次全树，这是实打实的泄漏。
+
+修法：`ImageNodes.walk`、`TreeDump.walk`、`firstImageUrl` 全部加 `try/finally` + `recycle()`。
+
+### 3. `endsWith("Image")` 误伤 `ImageButton`
+
+`android.widget.ImageButton` 也以 `Image` 结尾，会被当图片节点收进来。
+改为精确匹配 `.widget.Image` / `.widget.ImageView`。
+
+### 4. `isImageQuestion()` 重复遍历全树
+
+主路径里 `attempt` 已经调过 `readStructured()`，`isImageQuestion()` 内部又调一次。
+每轮多走一遍树。改为 `isImageQuestion(struct)` 复用。
+
+### 5. `decodeURIComponent` 遇畸形编码抛 URIError → /answer 500
+
+学习通若给出半截编码的 SVG，`decodeURIComponent` 直接抛，整个请求崩。
+加 try/catch 兜底走原始 payload。
+
+### 6. `textFromSvg` 的实体处理不全
+
+- 缺十进制/十六进制数字实体（`&#20013;` / `&#x4E2D;`）
+- 缺 CDATA：`<![CDATA[a < b]]>` 里的 `<` 会被当标签删掉
+- `&amp;` 必须最后替换，否则 `&amp;lt;` 会二次解码成 `<`
+
+修法：数字实体走 `String.fromCodePoint`（越界码点丢弃），CDATA 内容先把 `< >`
+换成占位符再还原，`&amp;` 放最后。
+
+### 附带：服务端下载加防护
+
+- `decodeURIComponent` 异常兜底
+- `Content-Length` 超 8MB 直接丢弃（`IMAGE_MAX_BYTES` 可调）
+- 下载带 `Referer: https://mooc1.chaoxing.com/`，学习通 CDN 对裸请求偶尔 403
+- 超时可配（`IMAGE_FETCH_TIMEOUT_MS`，默认 15s）
+
 ## 遗留风险
 
 1. **真实学习通未验证** —— 登录态为空。`targetUrl` 是 http 还是 data 未知。
 2. **`background-image` 场景** —— 图片若由 CSS 绘制，无 Image 节点，必须靠 OCR。
 3. **Canvas 渲染的图** —— 同上，a11y 只能看到一个 Canvas 节点。
-4. **图片鉴权** —— 若 CDN 地址带时效签名，服务端 `fetch` 可能 403。当前未处理重试。
+4. **图片鉴权** —— 若 CDN 地址带时效签名，服务端 `fetch` 可能 403。已加 Referer 但未做重试。
 5. **多图题** —— 一道题多张图时，`firstImageUrl` 只取最大的那张，会漏图。
+6. **叠层是否触发学习通切屏上报** —— 未验证。备选方案是 LSPosed hook 客户端上报逻辑。

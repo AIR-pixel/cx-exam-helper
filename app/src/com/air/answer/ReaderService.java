@@ -76,6 +76,8 @@ public class ReaderService extends AccessibilityService {
     private static final long POLL_MS = 2500;
     /** 上一次做 OCR 时的 a11y 文本，用于同一屏去重（避免反复 hide/show 闪屏） */
     private String lastOcrA11yText = "";
+    /** 上一次成功作答的图片 URL；用于发送前拦截同一张图的重复请求 */
+    private String lastImageUrl = "";
 
     private AnswerOverlay overlay;
     /** 静态引用，供 Main 配置页在 onResume 时直接撤掉叠层 */
@@ -364,10 +366,16 @@ public class ReaderService extends AccessibilityService {
      * 那种页面没有题型标签，不该截屏。三个条件同时成立才认定图片题。
      */
     private boolean isImageQuestion() {
+        // 保留这个无参重载给外部调用；主路径用 isImageQuestion(struct) 复用已抽好的 JSON，
+        // 避免每轮扫描把整棵 a11y 树走两遍（readStructured 本身不便宜）。
+        return isImageQuestion(readStructured());
+    }
+
+    /** 复用已抽好的 structured JSON 判断，省掉一次全树遍历 */
+    private boolean isImageQuestion(String structured) {
         try {
-            String s = readStructured();
-            if (s == null || s.isEmpty()) return false;
-            org.json.JSONObject j = new org.json.JSONObject(s);
+            if (structured == null || structured.isEmpty()) return false;
+            org.json.JSONObject j = new org.json.JSONObject(structured);
             String stem = j.optString("stem", "").trim();
             org.json.JSONArray arr = j.optJSONArray("options");
             int opts = arr == null ? 0 : arr.length();
@@ -526,12 +534,20 @@ public class ReaderService extends AccessibilityService {
             for (android.view.accessibility.AccessibilityWindowInfo w : wins) {
                 // 只看应用窗口，跳过状态栏(3)/输入法(2)/系统窗口
                 if (w.getType() != android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-                android.view.accessibility.AccessibilityNodeInfo root = w.getRoot();
-                if (root == null) continue;
-                for (ImageNodes.Shot s : ImageNodes.collect(root)) {
-                    if (s.url == null || s.url.isEmpty()) continue;
-                    if (!s.url.startsWith("data:") && !s.url.startsWith("http")) continue;
-                    if (s.width > bestW) { bestW = s.width; best = s.url; }
+                android.view.accessibility.AccessibilityNodeInfo root = null;
+                try {
+                    root = w.getRoot();
+                    if (root == null) continue;
+                    for (ImageNodes.Shot s : ImageNodes.collect(root)) {
+                        if (s.url == null || s.url.isEmpty()) continue;
+                        if (!s.url.startsWith("data:") && !s.url.startsWith("http")) continue;
+                        if (s.width > bestW) { bestW = s.width; best = s.url; }
+                    }
+                } finally {
+                    // getRoot 返回的节点由调用方回收；轮询每 2.5s 一次，不回收会累积
+                    if (root != null) {
+                        try { root.recycle(); } catch (Throwable ignored) { }
+                    }
                 }
             }
             return best;
@@ -551,6 +567,14 @@ public class ReaderService extends AccessibilityService {
      */
     private void handleWithImageUrl(final String a11yText, final String url) {
         if (inFlight) { deferredScan = true; return; }
+        // 发送前就去重：同一张图（URL 相同）已经答过就别再发请求。
+        // 不这么做的话，轮询每 2.5s 一跳都会把同一张图重发一遍，
+        // 只有等服务端返回后才发现 stableKey 重复——实测 10 秒发了 5 次。
+        if (url.equals(lastImageUrl) && !lastScreenHash.isEmpty()) {
+            Log.d(TAG, "image url skip: same url, already answered");
+            if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.show();
+            return;
+        }
         inFlight = true;
         new Thread(new Runnable() { public void run() {
             try {
@@ -570,6 +594,7 @@ public class ReaderService extends AccessibilityService {
                     return;
                 }
                 lastScreenHash = dedupKey;
+                lastImageUrl = url;
                 Log.d(TAG, "image-url answer src=" + a.source + " type=" + a.type + " => " + a.text);
                 Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
             } finally {

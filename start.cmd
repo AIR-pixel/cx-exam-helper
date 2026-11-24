@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title cx-exam-helper 一键启动
+title cx-exam-helper
 cd /d "%~dp0"
 
 echo ============================================================
@@ -39,9 +39,15 @@ if defined PY (
   echo [3/6] OCR skipped
 )
 
-echo [4/6] starting manager :18889 ...
-start "cx-manager" /min cmd /c "node "%~dp0server\manager.mjs""
-timeout /t 6 /nobreak >nul
+rem --- manager: reuse if already running (a second one would fail to bind) ---
+powershell -NoProfile -Command "try{(Invoke-RestMethod 'http://127.0.0.1:18889/api/status' -TimeoutSec 2)|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
+if errorlevel 1 (
+  echo [4/6] starting manager :18889 ...
+  start "cx-manager" /min cmd /c "node "%~dp0server\manager.mjs""
+  timeout /t 6 /nobreak >nul
+) else (
+  echo [4/6] manager already running
+)
 
 powershell -NoProfile -Command "try{(Invoke-RestMethod 'http://127.0.0.1:18889/api/status' -TimeoutSec 3)|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
 if errorlevel 1 (
@@ -52,12 +58,18 @@ if errorlevel 1 (
 )
 echo     manager OK
 
-echo [5/6] starting answer service :18888 ...
-powershell -NoProfile -Command "try{Invoke-RestMethod 'http://127.0.0.1:18889/api/start' -Method Post -TimeoutSec 30|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
+rem --- answer service: skip POST /api/start if already listening ---
+powershell -NoProfile -Command "try{(Invoke-RestMethod 'http://127.0.0.1:18888/health' -TimeoutSec 2)|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
 if errorlevel 1 (
-  echo     WARN: answer service failed to start
+  echo [5/6] starting answer service :18888 ...
+  powershell -NoProfile -Command "try{Invoke-RestMethod 'http://127.0.0.1:18889/api/start' -Method Post -TimeoutSec 30|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
+  if errorlevel 1 (
+    echo     WARN: answer service failed to start
+  ) else (
+    echo     answer OK
+  )
 ) else (
-  echo     answer OK
+  echo [5/6] answer service already running
 )
 
 where adb >nul 2>nul

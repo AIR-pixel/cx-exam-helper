@@ -47,7 +47,12 @@ public final class ImageNodes {
         if (n == null || depth > 40) return;
 
         String cls = String.valueOf(n.getClassName());
-        boolean isImage = cls.endsWith("Image") || cls.contains("ImageView");
+        // WebView 里 <img> 的节点类是 android.widget.Image（不是 ImageView）。
+        // 只认这两个精确名，别用 contains("Image")——会把 ImageButton、
+        // ImageSwitcher、FrameLayout 里带 Image 的都算进来。
+        boolean isImage = cls.endsWith(".widget.Image")
+                || cls.endsWith(".widget.ImageView")
+                || cls.endsWith("ImageView");
         if (isImage) {
             Shot s = read(n);
             if (s != null) out.add(s);
@@ -55,8 +60,18 @@ public final class ImageNodes {
 
         int cnt = n.getChildCount();
         for (int i = 0; i < cnt; i++) {
-            AccessibilityNodeInfo c = n.getChild(i);
-            if (c != null) walk(c, out, depth + 1);
+            // getChild 返回的节点由调用方负责 recycle；不回收会泄漏。
+            // 这里 walk 完立刻 recycle，避免轮询场景下节点池被撑爆。
+            AccessibilityNodeInfo c = null;
+            try {
+                c = n.getChild(i);
+                if (c != null) walk(c, out, depth + 1);
+            } catch (Throwable ignored) {
+            } finally {
+                if (c != null) {
+                    try { c.recycle(); } catch (Throwable ignored) { }
+                }
+            }
         }
     }
 
@@ -81,8 +96,9 @@ public final class ImageNodes {
         } catch (Throwable ignored) { }
 
         if (s.url.isEmpty() && s.desc.isEmpty()) return null;
-        // 状态栏小图标：没有 url、尺寸很小，丢掉
-        if (s.url.isEmpty() && (s.width > 0 && s.width < 80)) return null;
+        // 状态栏小图标：没有 url、尺寸很小，丢掉。
+        // width=0 说明节点没上报尺寸（不是「很小」），不能按小图标处理。
+        if (s.url.isEmpty() && s.width > 0 && s.width < 80) return null;
         return s;
     }
 

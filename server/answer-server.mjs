@@ -225,8 +225,16 @@ async function imageToBase64(image) {
     const meta = s.slice(5, comma);          // image/svg+xml;charset=utf-8 或 image/png;base64
     const payload = s.slice(comma + 1);
     if (/;base64/i.test(meta)) return payload;
-    // 非 base64 的 data URI：内容是 URL 编码的文本（SVG 常见）
-    const decoded = decodeURIComponent(payload);
+    // 非 base64 的 data URI：内容是 URL 编码的文本（SVG 常见）。
+    // decodeURIComponent 遇到畸形 % 序列会抛 URIError，必须兜住——
+    // 学习通若给出半截编码的 SVG，这里一抛整个 /answer 就 500。
+    let decoded;
+    try {
+      decoded = decodeURIComponent(payload);
+    } catch {
+      console.warn('[image] bad percent-encoding in data URI, use raw payload');
+      decoded = payload;
+    }
     const mime = meta.split(';')[0] || 'image/svg+xml';
     console.log(`[image] data URI ${mime}, ${decoded.length} chars decoded`);
     // SVG 走文本提取，不需要 OCR
@@ -236,9 +244,27 @@ async function imageToBase64(image) {
 
   if (/^https?:\/\//i.test(s)) {
     try {
-      const r = await fetch(s, { signal: AbortSignal.timeout(15000) });
+      const r = await fetch(s, {
+        signal: AbortSignal.timeout(Number(process.env.IMAGE_FETCH_TIMEOUT_MS || 15000)),
+        // 学习通 CDN 对没有 Referer 的请求偶尔 403，带上站点 Referer 更像正常浏览器
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+          referer: 'https://mooc1.chaoxing.com/',
+        },
+      });
       if (!r.ok) { console.warn(`[image] http ${r.status} ${s.slice(0, 80)}`); return ''; }
+      // 体积上限：题干图正常几百 KB，超过 8MB 基本是拿错了地址（比如下载了整个 PDF）
+      const MAX_BYTES = Number(process.env.IMAGE_MAX_BYTES || 8 * 1024 * 1024);
+      const clen = Number(r.headers.get('content-length') || 0);
+      if (clen > MAX_BYTES) {
+        console.warn(`[image] too large: ${clen} bytes > ${MAX_BYTES}`);
+        return '';
+      }
       const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length > MAX_BYTES) {
+        console.warn(`[image] too large after download: ${buf.length} bytes`);
+        return '';
+      }
       console.log(`[image] downloaded ${buf.length} bytes from ${s.slice(0, 80)}`);
       return buf.toString('base64');
     } catch (e) {
@@ -261,19 +287,37 @@ async function imageToBase64(image) {
  */
 function textFromSvg(svg) {
   const out = [];
+  // 非贪婪匹配 <text>...</text>；不用 .* 避免大 SVG 上的回溯爆炸。
+  // [\s\S] 是因为 SVG 里 text 内容可能跨行。
   const re = /<text[^>]*>([\s\S]*?)<\/text>/gi;
   let m;
   while ((m = re.exec(svg)) !== null) {
-    const t = m[1]
-      .replace(/<[^>]+>/g, '')          // 去掉嵌套标签
+    let t = m[1]
+      // CDATA 里的 < > 是字面量（不是标签），必须先换成占位符，
+      // 否则后面的剥标签正则会把它们连内容一起吃掉。
+      // \u0001 = '<'  \u0002 = '>'  \u0000 = CDATA 边界标记
+      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, inner) =>
+        '\u0000' + inner.replace(/</g, '\u0001').replace(/>/g, '\u0002') + '\u0000')
+      .replace(/<[^>]+>/g, '')                        // 去掉嵌套标签（tspan 等）
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => safeFromCode(parseInt(h, 16)))
+      .replace(/&#(\d+);/g, (_, d) => safeFromCode(parseInt(d, 10)))
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')      // &amp; 必须最后，否则 &amp;lt; 会变成 <
+      .replace(/\u0001/g, '<').replace(/\u0002/g, '>')   // 还原 CDATA 里的字面尖括号
+      .replace(/\u0000/g, '')                            // 去掉 CDATA 边界标记
       .trim();
     if (t) out.push(t);
   }
   if (out.length) console.log(`[image] svg text: ${out.length} lines, ${out.join(' ').length} chars`);
   return out.join('\n');
+}
+
+/** 数字实体转字符；越界码点（>0x10FFFF）直接丢掉，避免 String.fromCodePoint 抛 */
+function safeFromCode(n) {
+  if (!Number.isFinite(n) || n < 0 || n > 0x10ffff) return '';
+  try { return String.fromCodePoint(n); } catch { return ''; }
 }
 
 /**

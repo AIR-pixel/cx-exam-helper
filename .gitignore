@@ -34,3 +34,6 @@ Thumbs.db
 .mgr.log
 .mgr.err
 *.err
+
+# start.cmd 自测输出
+.start-out.txt

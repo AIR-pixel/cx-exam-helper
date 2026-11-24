@@ -88,6 +88,57 @@
 
 > OCR 依赖：`pip install rapidocr_onnxruntime`（已在本机 Python 3.13 验证）。
 
+### 图片题 URL 直取（2026-11-24，优先于 OCR）
+
+a11y 的 `Image` 节点 `extras` 里有 `AccessibilityNodeInfo.targetUrl`，就是图片地址
+（`data:` 或 `http(s):`），跟网页端脚本读 DOM 的 `img.src` 是同一份信息。
+拿到就不需要截屏、不需要 hide 叠层、不需要 OCR：
+
+| 环节 | URL 方案 | 截屏 OCR |
+|---|---|---|
+| 服务端识别 | SVG 抽 `<text>`：**9 ms** | RapidOCR：**3168 ms** |
+| 叠层 | 不碰 | 必须 hide→250ms→show |
+| 噪声 | 无 | 状态栏/标题栏/toast |
+
+双路兜底：`firstImageUrl()` 拿到就走 URL，拿不到自动退回截屏 OCR
+（`background-image` / Canvas 渲染的图没有 Image 节点，只能 OCR）。
+
+实现：`ImageNodes.java`（抽 targetUrl/尺寸/alt）、`ReaderService.handleWithImageUrl()`、
+服务端 `imageToBase64()`（归一 data:/http(s):/base64 三种输入）+ `textFromSvg()`。
+详见 [docs/19](docs/19-图片题URL方案调研.md)。
+
+> **只在 mock 上验证过。** 真实学习通登录态为空，`targetUrl` 是 http 还是 data 未知。
+
+### 手机端彻底退出
+
+三层，只做前两层不够：
+
+| 层 | 操作 | 效果 |
+|---|---|---|
+| 1 | 关无障碍 | 进程仍在，RSS 135MB |
+| 2 | `am force-stop` | 进程退，**5 秒后系统拉起** |
+| 3 | **注销无障碍注册** | 唯一彻底的方式 |
+
+第 3 层不能用 `Settings.Secure.putString(ENABLED_ACCESSIBILITY_SERVICES)`——
+需要 `WRITE_SECURE_SETTINGS`，普通应用写**静默失败**（实测：进程退了、注册还在）。
+必须用 `AccessibilityService.disableSelf()`，服务自身 API，零权限。
+
+App 内「彻底关闭（注销无障碍并退出）」按钮即走这条路：`hideOverlayNow()` →
+`disableSelfNow()` → 400ms → `stopService` + `finishAndRemoveTask` + `killProcess`。
+
+> LSPosed 音量键 hook 仍在 `system_server` 里活着，音量键双击还会发广播（无人接收）。
+> 要彻底停需 LSPosed 关模块并重启，或 `adb uninstall com.air.skipmodule`。
+
+### 资源占用实测
+
+| 场景 | CPU | 内存 RSS |
+|---|---|---|
+| 桌面空闲 30s | 0%（0 tick） | 134.8 MB |
+| 考试页轮询 60s | 0.33% 单核 | 140 MB |
+| 离开考试页 | 0%（自动停轮询） | 135 MB |
+
+RSS 看着大，实际是 WebView/a11y 框架共享库映射，Java Heap 只占 2 MB。
+
 ### 区域抽取 + root 隐藏（2026-11-24）
 
 **④ 区域抽取**：手机端 `ReaderService.readStructured()` 按 a11y 节点的屏幕 bounds
@@ -130,7 +181,8 @@ MockExam 三题型实测：单选 opts=4 / 多选 opts=4 / 判断 opts=2，题�
 五题型全链路复验（MockExam 逐页）：单选/多选/判断/填空/简答 的 stem、opts、
 typeLabel、叠层宽度全部正确；填空与简答走 qoder 实模型，其余命中缓存。
 
-测试：`test-core` 170 + `test-cache` 25 + `e2e-server` 34 + `e2e-qoder` 24 = **253 项全绿**。
+测试：`test-core` 170 + `test-cache` 25 + `.probe-ocr-clean` 39 + `test-image-url` 22
++ `e2e-server` 34 + `e2e-qoder` 24 = **314 项全绿**。
 
 ### 手机 ↔ PC 无线连接（教室手机、宿舍 PC 的场景）
 

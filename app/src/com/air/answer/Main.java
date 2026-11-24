@@ -187,11 +187,16 @@ public class Main extends Activity {
         //    而 Settings.Secure.putString 需要 WRITE_SECURE_SETTINGS，普通应用
         //    写会静默失败（实测：进程退了、注册还在）。只有 disableSelf() 有效。
         ReaderService.disableSelfNow();
+        android.util.Log.i("Main", "shutdown: disableSelf issued");
 
-        // 3. 停服务 + 杀进程。给系统 400ms 处理注销，再退。
+        // 3. 停服务 + 杀进程。
+        //    给系统 400ms 处理注销：实测 disableSelf 走 Binder 异步回来，
+        //    立刻 kill 会让 unbind 来不及完成，注册残留。
+        //    400ms 后如果还在（极少数机型慢），靠 force-stop 兜底也够了。
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
                 new Runnable() {
                     public void run() {
+                        android.util.Log.i("Main", "shutdown: stopping service and killing process");
                         try { stopService(new Intent(Main.this, ReaderService.class)); } catch (Throwable ignored) { }
                         finishAndRemoveTask();
                         android.os.Process.killProcess(android.os.Process.myPid());
