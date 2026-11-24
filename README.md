@@ -29,13 +29,67 @@
 
 | 目录 | 内容 |
 |---|---|
-| `docs/` | 17 篇研究文档（00 总报告 → 16 全流程实验） |
+| `docs/` | 20 篇研究文档（00 总报告 → 19 图片题 URL 方案） |
 | `app/` | 安卓端无障碍服务 + 浮层（`build.ps1` 构建 answer-app 和 exam-mock 两个 APK） |
 | `xposed/` | SKIP_SCREENSHOT 模块（含 xposed-api-stub 编译桩） |
 | `mock/` | 学习通考试页仿真（WebView，五种题型） |
 | `server/` | PC 端答题服务 + **可视化管理页**（见下） |
 | `scripts/` | 设备调试脚本 + LSPosed DB 工具 |
 | `evidence/` | 真机验证截图（A/B 对照 / 滚动 / 浅灰 UI） |
+
+## 控制端源码在哪里
+
+**全部源码在仓库里，不含任何编译产物（`.apk` 一律 `.gitignore` 排除，也不发 Release）。**
+自己编译即可，见下面的「编译」。
+
+### 电脑端控制文件
+
+| 文件 | 作用 |
+|---|---|
+| `start.cmd` | **一键启动**：查 Node/Python → 起 OCR `:18890` → 起 manager `:18889` → POST `/api/start` 拉起 `:18888` → `adb reverse` → 开浏览器 |
+| `stop.cmd` | 按端口杀 18888/18889/18890 |
+| `start-manager.cmd` | 只起管理页（不起答题服务） |
+| `server/manager.mjs` | 管理页后端，303 行。路由 `/api/status`、`/api/network`、`/api/config`、`/api/start`、`/api/stop`、`/api/logs` |
+| `server/index.html` | 管理页前端，单文件 294 行（无框架、无外链） |
+| `server/answer-server.mjs` | 答题服务主体 |
+| `server/answer-core.mjs` | 解析器（题干/选项/题型抽取） |
+| `server/answer-cache.mjs` | SQLite 题库（`node:sqlite`） |
+| `server/engine-qoder.mjs` | DSH/qoder 上游 |
+| `server/ocr_server.py` | RapidOCR 服务（`:18890`） |
+| `app/build.ps1` | 编译两个 APK |
+| `xposed/build-module.ps1` | 编译 LSPosed 模块 |
+
+### 手机端控制软件
+
+| 文件 | 作用 |
+|---|---|
+| `app/AndroidManifest.xml` | 权限、服务、接收器声明 |
+| `app/src/com/air/answer/Main.java` | **配置界面**：服务地址、总开关、叠层开关、诊断开关、**彻底关闭** |
+| `app/src/com/air/answer/ReaderService.java` | 无障碍服务主体（读题、轮询、上送、去重） |
+| `app/src/com/air/answer/AnswerOverlay.java` | 浮层渲染（`TYPE_ACCESSIBILITY_OVERLAY`） |
+| `app/src/com/air/answer/ImageNodes.java` | 从 a11y 树抽图片节点 `targetUrl` |
+| `app/src/com/air/answer/TreeDump.java` | 诊断：dump 整棵 a11y 树 |
+| `app/src/com/air/answer/ToggleStore.java` | 开关持久化（SharedPreferences + flag 文件） |
+| `app/src/com/air/answer/Bus.java` | 状态总线 |
+| `app/src/com/air/answer/ConfigStore.java` | 服务地址持久化 |
+| `app/src/com/air/answer/ToggleReceiver.java` | 音量键广播接收器 |
+| `app/src/com/air/answer/FloatService.java` | 前台服务保活 |
+| `app/src/com/air/answer/TextExtract.java` | a11y 文本线性化 |
+| `app/src/com/air/answer/StructExtract.java` | 结构化抽取（题干/选项/题型） |
+| `xposed/VolKeyModule.java` | 音量键双击（hook `system_server`） |
+| `xposed/SkipModule.java` | `SKIP_SCREENSHOT`（hook `ViewRootImpl#setView`） |
+
+### 编译
+
+```powershell
+# 手机端两个 APK（answer-app 控制软件 + exam-mock 仿真考试页）
+powershell -ExecutionPolicy Bypass -File app\build.ps1
+
+# LSPosed 模块
+powershell -ExecutionPolicy Bypass -File xposed\build-module.ps1
+```
+
+产物落在 `app/build/*/signed.apk`、`xposed/build/signed.apk`，已被 `.gitignore` 排除。
 
 ## 真机实验结论（`docs/16-单设备全流程实验.md`）
 
