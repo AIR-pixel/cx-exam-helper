@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cx-exam-helper · PC 管理页</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#181b22; --panel2:#20242d; --line:#2c313c;
+    --text:#e6e8ee; --muted:#9aa1af; --accent:#5b9dff; --ok:#3ecf8e; --warn:#f5a524; --err:#ff5d5d;
+    --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+  header h1{font-size:18px;margin:0;font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px #ffffff0d}
+  .dot.run{background:var(--ok);box-shadow:0 0 0 3px #3ecf8e22}
+  .dot.err{background:var(--err)}
+  main{max-width:1100px;margin:0 auto;padding:24px;display:grid;grid-template-columns:1fr 1fr;gap:20px}
+  @media(max-width:820px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
+  .card.wide{grid-column:1/-1}
+  .card h2{font-size:14px;margin:0 0 16px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .row{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  .row label{min-width:96px;color:var(--muted)}
+  .row .grow{flex:1}
+  input,select{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:7px;padding:8px 10px;font:inherit;width:100%}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  input[type=checkbox]{width:auto;accent-color:var(--accent)}
+  button{background:var(--accent);border:0;color:#fff;border-radius:7px;padding:9px 16px;font:inherit;cursor:pointer;font-weight:600}
+  button:hover{filter:brightness(1.1)}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--text)}
+  button.danger{background:var(--err)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .btns{display:flex;gap:10px;flex-wrap:wrap}
+  .status{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
+  .stat{background:var(--panel2);border-radius:8px;padding:12px 14px}
+  .stat .k{color:var(--muted);font-size:12px}
+  .stat .v{font-size:18px;font-weight:600;margin-top:2px;word-break:break-all}
+  .engines{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:18px}
+  .eng{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 6px;text-align:center;cursor:pointer;transition:.15s}
+  .eng:hover{border-color:var(--accent)}
+  .eng.sel{border-color:var(--accent);background:#5b9dff1f}
+  .eng .n{font-weight:600}
+  .eng .d{font-size:11px;color:var(--muted)}
+  .hint{font-size:12px;color:var(--muted);margin:-4px 0 14px}
+  pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px;height:300px;overflow:auto;font:12px/1.5 Consolas,monospace;white-space:pre-wrap;word-break:break-all;margin:0}
+  .cache-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .toast{position:fixed;right:20px;bottom:20px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px 18px;opacity:0;transition:.25s;pointer-events:none;z-index:99}
+  .toast.show{opacity:1}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;background:#5b9dff22;color:var(--accent);font-size:12px}
+  .sep{height:1px;background:var(--line);margin:16px 0}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>cx-exam-helper · PC 管理页</h1>
+  <span class="pill" id="enginePill">引擎 —</span>
+</header>
+
+<main>
+  <!-- 状态 -->
+  <section class="card wide">
+    <h2>运行状态</h2>
+    <div class="status">
+      <div class="stat"><div class="k">答题服务</div><div class="v" id="stSrv">—</div></div>
+      <div class="stat"><div class="k">进程 PID</div><div class="v" id="stPid">—</div></div>
+      <div class="stat"><div class="k">运行时间</div><div class="v" id="stTime">—</div></div>
+    </div>
+    <div class="btns">
+      <button id="btnStart">▶ 启动答题服务</button>
+      <button id="btnStop" class="danger">■ 停止</button>
+      <button id="btnHealth" class="ghost">健康检查</button>
+      <button id="btnRefresh" class="ghost">刷新状态</button>
+    </div>
+    <div class="sep"></div>
+    <div class="cache-grid">
+      <div class="stat"><div class="k">题库条数</div><div class="v" id="caTotal">—</div></div>
+      <div class="stat"><div class="k">累计命中</div><div class="v" id="caHits">—</div></div>
+      <div class="stat"><div class="k">缓存文件</div><div class="v" id="caPath" style="font-size:12px">—</div></div>
+      <div class="stat"><div class="k">操作</div><div class="v"><button id="btnClear" class="ghost" style="padding:4px 10px;font-size:12px">清空题库</button></div></div>
+    </div>
+  </section>
+
+  <!-- 引擎选择 -->
+  <section class="card">
+    <h2>作答引擎</h2>
+    <div class="engines" id="engines">
+      <div class="eng" data-e="auto"><div class="n">auto</div><div class="d">DSH 优先·兜底</div></div>
+      <div class="eng" data-e="qoder"><div class="n">qoder</div><div class="d">DSH 接口</div></div>
+      <div class="eng" data-e="openai"><div class="n">openai</div><div class="d">自定义 API</div></div>
+      <div class="eng" data-e="heuristic"><div class="n">heuristic</div><div class="d">本地占位</div></div>
+      <div class="eng" data-e="echo"><div class="n">echo</div><div class="d">链路自测</div></div>
+    </div>
+    <p class="hint">切换引擎会先停止当前服务、保存配置；点「启动答题服务」生效（运行中改配置会自动重启）。</p>
+    <div class="row"><label>服务端口</label><input id="cfgPort" type="number" min="1024" max="65535"></div>
+    <div class="row"><label>缓存文件</label><input id="cfgCache"></div>
+    <div class="row"><label>模型超时(ms)</label><input id="cfgTimeout" type="number"></div>
+    <div class="row"><label>长文本自测</label><input id="cfgLong" type="checkbox"><span class="hint" style="margin:0">LONG_TEST：简答返回超长文本，验证浮层滚动（不耗额度）</span></div>
+  </section>
+
+  <!-- 配置 -->
+  <section class="card">
+    <h2>接口配置</h2>
+    <div id="dshBox">
+      <h2 style="margin-top:0">DSH / qoder 接口</h2>
+      <div class="row"><label>区域</label>
+        <select id="cfgRegion"><option value="cn">cn（国内）</option><option value="global">global</option></select>
+      </div>
+      <div class="row"><label>模型 key</label><input id="cfgQModel" placeholder="dfmodel"></div>
+      <div class="row"><label>PAT</label><input id="cfgQPat" type="password" placeholder="留空则用本地 ~/.dsh 凭据"></div>
+      <p class="hint" id="patHint">留空自动读取 ~/.dsh/.qoder-accounts.cn.json；填写则覆盖。</p>
+    </div>
+    <div class="sep"></div>
+    <div id="apiBox">
+      <h2 style="margin-top:0">OpenAI 兼容 API</h2>
+      <div class="row"><label>Base URL</label><input id="cfgBase" placeholder="https://api.example.com/v1"></div>
+      <div class="row"><label>API Key</label><input id="cfgKey" type="password" placeholder="sk-..."></div>
+      <div class="row"><label>模型名</label><input id="cfgModel" placeholder="gpt-4o-mini"></div>
+    </div>
+    <div class="btns" style="margin-top:18px">
+      <button id="btnSave">保存配置</button>
+      <button id="btnModels" class="ghost">查询 DSH 模型列表</button>
+    </div>
+  </section>
+
+  <!-- 日志 + 题库 -->
+  <section class="card wide">
+    <h2>实时日志 <span class="hint" style="float:right">答题服务 stdout / stderr</span></h2>
+    <pre id="logBox">（尚未启动）</pre>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let cfg = {}, status = {};
+
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 2600);
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if(!r.ok && j.error) throw new Error(j.error);
+  return j;
+}
+function renderCfg(c){
+  cfg = c;
+  $('cfgPort').value = c.port || 18888;
+  $('cfgCache').value = c.cachePath || '';
+  $('cfgTimeout').value = c.timeoutMs || 90000;
+  $('cfgLong').checked = !!c.longTest;
+  $('cfgRegion').value = c.qoderRegion || 'cn';
+  $('cfgQModel').value = c.qoderModel || 'dfmodel';
+  $('cfgQPat').value = '';
+  $('cfgQPat').placeholder = c._hasQoderPat ? '••••••••（已设置，留空保持不变）' : '留空则用本地 ~/.dsh 凭据';
+  $('cfgBase').value = c.openaiBase || '';
+  $('cfgKey').value = '';
+  $('cfgKey').placeholder = c._hasOpenaiKey ? '••••••••（已设置，留空保持不变）' : 'sk-...';
+  $('cfgModel').value = c.openaiModel || '';
+  document.querySelectorAll('.eng').forEach(e => e.classList.toggle('sel', e.dataset.e === c.engine));
+  $('enginePill').textContent = '引擎 ' + (c.engine || '—');
+}
+
+function renderStatus(s){
+  status = s;
+  const running = !!s.running;
+  $('dot').className = 'dot' + (running ? ' run' : '');
+  $('stSrv').textContent = running ? '运行中' : '已停止';
+  $('stPid').textContent = s.pid || '—';
+  $('stTime').textContent = s.startedAt ? new Date(s.startedAt).toLocaleTimeString('zh-CN') : '—';
+  $('btnStart').disabled = running;
+  $('btnStop').disabled = !running;
+  $('enginePill').textContent = '引擎 ' + (s.engine || '—');
+  const logs = s.logs || [];
+  $('logBox').textContent = logs.length ? logs.join('\n') : '（尚无日志）';
+  $('logBox').scrollTop = $('logBox').scrollHeight;
+}
+
+async function refresh(){
+  try { renderStatus(await api('/api/status')); }
+  catch(e){ toast('刷新失败: ' + e.message); }
+  try { const st = await api('/stats'); renderCache(st); }
+  catch(e){ /* 答题服务未启，忽略 */ }
+}
+function renderCache(st){
+  if(!st || st.error) return;
+  $('caTotal').textContent = st.total ?? '—';
+  $('caHits').textContent = st.hits ?? '—';
+  $('caPath').textContent = (st.path || '—').split(/[\\/]/).pop();
+}
+
+function collect(){
+  // 密码框留空 = 保持原值；非空 = 覆盖
+  const qPat = $('cfgQPat').value.trim();
+  const oKey = $('cfgKey').value.trim();
+  return {
+    engine: document.querySelector('.eng.sel')?.dataset.e || 'auto',
+    port: Number($('cfgPort').value) || 18888,
+    cachePath: $('cfgCache').value.trim() || './answer-cache.db',
+    timeoutMs: Number($('cfgTimeout').value) || 90000,
+    longTest: $('cfgLong').checked,
+    qoderRegion: $('cfgRegion').value,
+    qoderModel: $('cfgQModel').value.trim() || 'dfmodel',
+    ...(qPat ? { qoderPat: qPat } : {}),
+    openaiBase: $('cfgBase').value.trim(),
+    ...(oKey ? { openaiKey: oKey } : {}),
+    openaiModel: $('cfgModel').value.trim(),
+  };
+}
+
+// 事件
+document.querySelectorAll('.eng').forEach(e => e.addEventListener('click', () => {
+  document.querySelectorAll('.eng').forEach(x => x.classList.remove('sel'));
+  e.classList.add('sel');
+  $('enginePill').textContent = '引擎 ' + e.dataset.e;
+}));
+$('btnStart').onclick = async () => {
+  try { const r = await api('/api/start',{method:'POST'}); toast(r.ok ? '已启动 pid=' + r.pid : (r.error||'启动失败')); refresh(); }
+  catch(e){ toast(e.message); }
+};
+$('btnStop').onclick = async () => {
+  try { const r = await api('/api/stop',{method:'POST'}); toast(r.ok ? '已停止' : (r.error||'停止失败')); refresh(); }
+  catch(e){ toast(e.message); }
+};
+$('btnSave').onclick = async () => {
+  try { const r = await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(collect())});
+    renderCfg(r.config); toast('配置已保存' + (r.restarted ? '（服务已自动重启）' : '')); refresh(); }
+  catch(e){ toast('保存失败: ' + e.message); }
+};
+$('btnHealth').onclick = async () => {
+  try { const r = await api('/health'); toast('OK · 引擎=' + r.engine + ' · 运行 ' + r.uptime + 's'); }
+  catch(e){ toast('健康检查失败: ' + e.message); }
+};
+$('btnRefresh').onclick = refresh;
+$('btnClear').onclick = async () => {
+  if(!confirm('确定清空题库？此操作不可撤销。')) return;
+  try { await api('/cache/clear',{method:'POST'}); toast('题库已清空'); refresh(); }
+  catch(e){ toast(e.message); }
+};
+$('btnModels').onclick = async () => {
+  try {
+    const r = await api('/models');
+    const names = (r.models||[]).map(m => m.key + ' · ' + m.display_name).join('\n');
+    alert('DSH 模型列表（' + (r.count||0) + '）：\n\n' + (names || '(空)'));
+  } catch(e){ toast('查询失败: ' + e.message); }
+};
+
+// 初始加载 + 每 3s 刷新状态/日志
+(async () => {
+  try { renderCfg(await api('/api/config')); } catch(e){ toast('配置加载失败: ' + e.message); }
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>
+</body>
+</html>

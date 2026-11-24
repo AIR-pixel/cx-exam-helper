@@ -33,7 +33,7 @@
 | `app/` | 安卓端无障碍服务 + 浮层（`build.ps1` 构建 answer-app 和 exam-mock 两个 APK） |
 | `xposed/` | SKIP_SCREENSHOT 模块（含 xposed-api-stub 编译桩） |
 | `mock/` | 学习通考试页仿真（WebView，五种题型） |
-| `server/` | PC 端答题服务（a11y 文本 → 结构化 → 答案） |
+| `server/` | PC 端答题服务 + **可视化管理页**（见下） |
 | `scripts/` | 设备调试脚本 + LSPosed DB 工具 |
 | `evidence/` | 真机验证截图（A/B 对照 / 滚动 / 浅灰 UI） |
 
@@ -46,7 +46,23 @@
 - 长答案自动滚动实测：三连拍像素 diff 44.7% / 41.4% / 46.2%（在滚），短答案 0.00%（不滚）。
 - 浅灰透明背板（10% alpha）不遮题面。
 
-### 快速跑（PC 端）
+### PC 可视化管理页（推荐）
+
+双击仓库根目录的 `start-manager.cmd`（或 `node server/manager.mjs`），浏览器打开
+**http://127.0.0.1:18889**。页面能做的：
+
+- **启停打包好的答题服务**（`answer-server.mjs`）：一键 start / stop，实时显示 PID、运行状态与日志
+- **引擎切换**：`auto`（DSH 优先+兜底）/ `qoder`（DSH 接口）/ `openai`（任意兼容 API）/ `heuristic` / `echo`
+- **接口配置**：
+  - DSH/qoder：区域（cn/global）、模型 key、PAT（留空自动读 `~/.dsh/.qoder-accounts.cn.json`）
+  - OpenAI 兼容 API：Base URL / Key / 模型名，可一键拉取 DSH 模型列表
+- 配置持久化到 `server/config.json`（**已被 .gitignore 排除**，PAT / Key 明文不入库）；页面回显密码字段始终脱敏
+- 题库统计 / 一键清空、健康检查、`LONG_TEST` 自测开关（超长文本验浮层滚动，不耗额度）
+- 运行中改配置会自动重启答题服务
+
+> 手机侧仍需 `adb reverse tcp:18888 tcp:18888`（每次重启后重建）。
+
+### 快速跑（PC 端 · 纯命令行）
 
 ```bash
 # 1. 起答题服务（需 Node ≥ 18）

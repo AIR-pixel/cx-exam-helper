@@ -19,6 +19,11 @@
 # ===== 凭据/密钥 =====
 *.keystore
 
+# 管理页配置（可能含 PAT / API Key 明文，禁止入库）
+server/config.json
+manager-test.log
+manager-test.err
+
 # ===== 系统 =====
 Thumbs.db
 .DS_Store
