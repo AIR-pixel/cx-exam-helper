@@ -7,6 +7,7 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -56,6 +57,22 @@ public class Main extends Activity {
             }
         });
 
+        // 答题服务地址（USB 用 127.0.0.1；无线填 PC 的 Tailscale IP 或局域网 IP）
+        ConfigStore.init(this);
+        final EditText ep = new EditText(this);
+        ep.setHint("答题服务地址");
+        ep.setText(ConfigStore.endpoint());
+        ep.setSingleLine(true);
+
+        Button saveEp = new Button(this);
+        saveEp.setText("保存地址（无线连接填 PC 的 IP）");
+        saveEp.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                ConfigStore.setEndpoint(ep.getText().toString());
+                dump();
+            }
+        });
+
         Button refresh = new Button(this);
         refresh.setText("刷新状态");
         refresh.setOnClickListener(new View.OnClickListener() {
@@ -64,6 +81,9 @@ public class Main extends Activity {
 
         root.addView(title);
         root.addView(hint);
+        root.addView(new TextView(this)); // 间距
+        root.addView(ep);
+        root.addView(saveEp);
         root.addView(a11y);
         root.addView(refresh);
         root.addView(stat);
@@ -74,6 +94,7 @@ public class Main extends Activity {
     private void dump() {
         Bus.Msg m = Bus.last();
         StringBuilder sb = new StringBuilder();
+        sb.append("服务地址：").append(ConfigStore.endpoint()).append('\n');
         sb.append("状态：").append(Bus.status()).append('\n');
         if (m != null && !m.answer.isEmpty()) {
             sb.append("来源：").append(m.source)

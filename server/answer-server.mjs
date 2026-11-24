@@ -38,6 +38,8 @@ import { AnswerCache } from './answer-cache.mjs';
 import { qoderAvailable, qoderChat, qoderModels } from './engine-qoder.mjs';
 
 const PORT = Number(process.env.ANSWER_PORT || 18888);
+// 监听地址：默认 127.0.0.1（USB reverse）。无线场景设 0.0.0.0 接受局域网/Tailscale 连接。
+const BIND = process.env.ANSWER_BIND || '127.0.0.1';
 const CACHE_PATH = process.env.ANSWER_CACHE === '' ? ':memory:'
   : (process.env.ANSWER_CACHE || './answer-cache.db');
 // 图片题 OCR：Python RapidOCR 微服务地址，空字符串 = 关闭
@@ -376,7 +378,8 @@ const server = http.createServer(async (req, res) => {
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
       const r = await solve(text, structured);
-      console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`);
+      const from = req.socket.remoteAddress || '-';
+      console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'} from=${from}`);
       return json(res, {
         answer: r.answer,
         source: r.source,
@@ -397,8 +400,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Answer server v2.1 on 127.0.0.1:${PORT}`);
+server.listen(PORT, BIND, () => {
+  console.log(`Answer server v2.1 on ${BIND}:${PORT}`);
   console.log(`  engine = ${engineMode}${engineReq !== engineMode ? ` (requested ${engineReq})` : ''}`);
   console.log(`  cache  = ${cache ? cache.path : 'disabled'}`);
 });

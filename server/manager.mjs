@@ -18,6 +18,7 @@
  */
 
 import http from 'node:http';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -39,6 +40,7 @@ const NODE_BIN = process.execPath; // 用同一个 node 跑子进程，避免 PA
 const DEFAULT_CONFIG = {
   engine: 'auto',           // auto | qoder | openai | heuristic | echo
   port: SERVER_PORT,
+  bind: '127.0.0.1',        // 127.0.0.1=仅本机USB；0.0.0.0=接受局域网/Tailscale 无线连接
   // DSH / qoder
   qoderModel: 'dfmodel',
   qoderPat: '',             // 留空 = 用 ~/.dsh/.qoder-accounts.cn.json
@@ -76,6 +78,7 @@ function buildEnv() {
   const env = { ...process.env };
   env.ANSWER_ENGINE = config.engine;
   env.ANSWER_PORT = String(config.port);
+  env.ANSWER_BIND = config.bind || '127.0.0.1';
   env.ANSWER_TIMEOUT_MS = String(config.timeoutMs);
   env.ANSWER_CACHE = config.cachePath || ':memory:';
   if (config.qoderModel) env.QODER_MODEL = config.qoderModel;
@@ -94,11 +97,15 @@ function buildEnv() {
 
 let child = null;
 let logs = [];
+let lastClientIp = '';
 const MAX_LOGS = 500;
 
 function log(line) {
   const t = new Date().toISOString().slice(11, 19);
   logs.push(`[${t}] ${line}`);
+  // 从 answer-server 的 "[answer] ... from=<ip>" 行提取手机来源 IP
+  const m = String(line).match(/\[answer\].*from=([^\s]+)/);
+  if (m) lastClientIp = m[1];
   if (logs.length > MAX_LOGS) logs = logs.slice(-MAX_LOGS);
 }
 
@@ -221,6 +228,24 @@ const manager = http.createServer(async (req, res) => {
     // 状态
     if (u.pathname === '/api/status') {
       return send(res, { ...childState(), logs: logs.slice(-80), config: publicConfig() });
+    }
+
+    // 本机网络地址：管理页据此告诉用户"手机端该填哪个 IP"
+    if (u.pathname === '/api/network') {
+      const addrs = [];
+      const ifs = os.networkInterfaces();
+      for (const [name, list] of Object.entries(ifs)) {
+        for (const a of list || []) {
+          if (a.family === 'IPv4' && !a.internal) {
+            addrs.push({ ip: a.address, iface: name,
+              // Tailscale 网卡通常是 100.x / utun / Tailscale
+              kind: /^100\./.test(a.address) || /tailscale|utun/i.test(name) ? 'tailscale' : 'lan' });
+          }
+        }
+      }
+      // 最近一次 /answer 的来源 IP（手机是否连上的证据）
+      const lastClient = lastClientIp;
+      return send(res, { addrs, port: config.port, bind: config.bind, lastClient });
     }
 
     // 配置读（脱敏）

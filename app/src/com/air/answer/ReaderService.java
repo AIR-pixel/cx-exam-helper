@@ -31,7 +31,6 @@ import java.nio.charset.StandardCharsets;
  */
 public class ReaderService extends AccessibilityService {
     private static final String TAG = "AnsReader";
-    private static final String ENDPOINT = "http://127.0.0.1:18888/answer";
     private static final int DEBOUNCE_MS = 250;
     private static final int MIN_TEXT_LEN = 6;
     private static final int MAX_ATTEMPTS = 6;
@@ -66,6 +65,7 @@ public class ReaderService extends AccessibilityService {
         }
 
         ToggleStore.init(this);
+        ConfigStore.init(this);
         overlay = new AnswerOverlay(this);
         busListener = new Bus.Listener() {
             public void onUpdate(Bus.Msg m) {
@@ -412,7 +412,7 @@ public class ReaderService extends AccessibilityService {
     private Answer askPC(String question, String image, String structured) {
         HttpURLConnection conn = null;
         try {
-            conn = (HttpURLConnection) new URL(ENDPOINT).openConnection();
+            conn = (HttpURLConnection) new URL(ConfigStore.endpoint()).openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setDoOutput(true);

@@ -107,6 +107,28 @@ MockExam 三题型实测：单选 opts=4 / 多选 opts=4 / 判断 opts=2，题�
   设备当前停在需 PIN 的锁屏，无法自动完成这一步。
 - 相关脚本：`scripts/denylist-setup.sh` / `shamiko-setup.sh` / `shamiko-verify.sh` / `coexist-verify.sh`。
 
+### 手机 ↔ PC 无线连接（教室手机、宿舍 PC 的场景）
+
+USB `adb reverse` 只适合同机调试。异地场景改成**手机直连 PC 的 IP**：
+
+1. **PC 端**：管理页 →「手机连接」→ 监听地址选 `0.0.0.0`（answer-server 加 `ANSWER_BIND=0.0.0.0`）。
+2. **手机端**：打开「答案助手」App → 服务地址栏填 PC 的 IP，如
+   `http://100.x.y.z:18888/answer`。管理页「电脑地址」区会列出可选地址。
+3. 两种方式：
+   - **Tailscale（推荐，跨网段）**：两端登录同一 tailnet，填 PC 的 100.x IP。
+     ⚠️ **不要开 Exit Node**——Tailscale 默认只路由 tailnet 内网段，学习通访问公网的
+     流量/IP 不变；Android v1.70+ 还可在 Tailscale 里把学习通加入 split-tunneling
+     排除名单，让它的流量和 DNS 完全不走 Tailscale（双保险）。
+   - **局域网 WiFi**：PC 与手机同一网段时填 PC 的 192.168.x / 10.x IP。
+4. 管理页「最近手机请求 IP」会显示手机是否连上（从 answer-server 的 `from=` 日志提取）。
+
+配置持久化：手机地址存 `SharedPreferences` + `/data/data/com.air.mpprobe/files/endpoint.txt`
+（flag 文件优先，方便脚本改）；PC bind 存 `server/config.json`。
+
+**Tailscale 风险调研结论**：学习通公开检测项（官方《常见问题》+监考说明）是切屏、
+摄像头抓拍、人脸、截屏、IP/地区、网络连通性（错误码 106/105），**未见 VPN 网卡/进程检测**。
+关键是不开 Exit Node，学习通看到的公网 IP 不变；再用 split-tunneling 排除学习通即万无一失。
+
 ### 快速跑（PC 端 · 纯命令行）
 
 ```bash
