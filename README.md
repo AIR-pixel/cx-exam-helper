@@ -107,6 +107,31 @@ MockExam 三题型实测：单选 opts=4 / 多选 opts=4 / 判断 opts=2，题�
   设备当前停在需 PIN 的锁屏，无法自动完成这一步。
 - 相关脚本：`scripts/denylist-setup.sh` / `shamiko-setup.sh` / `shamiko-verify.sh` / `coexist-verify.sh`。
 
+### 非答题页闸门 + 题干抽取修复（2026-11-24 晚）
+
+> 详见 `docs/17-非答题页误触发与题干抽取修复.md`
+
+真机联调（学习通 7.0.4 登录页）暴露四个缺陷，已修并留 45 项断言：
+
+1. **服务端缺「是不是题目」判据** —— 登录页清洗后剩一行「我已阅读并同意…」，
+   被当成无选项简答题送模型（2818ms），还入缓存。新增 `looksLikeQuestion()`：
+   选项≥2 / 题型标签 / 题干特征（问句·分值·空位·题干动词）/ 考试页兜底 四档。
+   修复后同屏 28ms 返回 `source=none`，零模型调用。
+2. **设备端 OCR 兜底不过闸** —— a11y 判 `usable=false` 后无条件截屏上送 210KB。
+   新增 `isExamPage()`（`交卷|答题卡|上一题|下一题|剩余时间|倒计时|共N题`）+ `source=none` 二次拦截。
+   真机日志从 `sending 210KB image` 变成 `OCR fallback skipped: not an exam page`。
+3. **重试链并发** —— `removeCallbacks` 只能取消没跑的那一跳，登录页高频
+   `windowContentChanged` 让多条 6 次重试链同时跑。加 `scanGen` 代次作废旧链，
+   日志按内容变化去重（几十条 → 25 行）。
+4. **简答题题干抽成输入框 hint** —— `STRUCT stem=在此输入你的答案`，模型回
+   "请提供具体题目"。根因是「取选项上方最靠下的长文本」，而 hint 位置更靠下且 9 字过门槛。
+   加 `isPlaceholder()` 排除占位文案，带题号/分值的行优先于「最靠下的长文本」。
+
+五题型全链路复验（MockExam 逐页）：单选/多选/判断/填空/简答 的 stem、opts、
+typeLabel、叠层宽度全部正确；填空与简答走 qoder 实模型，其余命中缓存。
+
+测试：`test-core` 170 + `test-cache` 25 + `e2e-server` 34 + `e2e-qoder` 24 = **253 项全绿**。
+
 ### 手机 ↔ PC 无线连接（教室手机、宿舍 PC 的场景）
 
 USB `adb reverse` 只适合同机调试。异地场景改成**手机直连 PC 的 IP**：

@@ -33,7 +33,8 @@
  */
 
 import http from 'node:http';
-import { parseScreen, parseStructured, parseAnswerText, countBlanks } from './answer-core.mjs';
+import { parseScreen, parseStructured, parseAnswerText, countBlanks, detectType,
+         isOcrUiNoise, stripLeadingUiCrumb } from './answer-core.mjs';
 import { AnswerCache } from './answer-cache.mjs';
 import { qoderAvailable, qoderChat, qoderModels } from './engine-qoder.mjs';
 
@@ -229,12 +230,73 @@ async function ocrImage(base64) {
 }
 
 /**
- * 一条 a11y 文本 → 答案
+ * OCR 文本预处理：去掉状态栏/标题栏/toast 碎片，把粘连的选项字母拆开。
+ *
+ * 实测一张 1080x2400 的图片题截图，RapidOCR 输出长这样：
+ *   3.08 / 9:30 / (77 / KB/s / Exam Mock / 个报文丢失会使… / B4.避拥塞控制…
+ * 前面几条是状态栏和标题栏，中间是上一题叠层的残留，最后才是真题干。
+ * 不清洗会把噪声当题干喂给模型。
  */
-async function solve(text, preStructured) {
+function cleanOcrText(ocrText) {
+  const lines = String(ocrText || '').split('\n');
+  const out = [];
+  for (let line of lines) {
+    let t = line.trim();
+    if (!t) continue;
+    if (isOcrUiNoise(t)) continue;
+    // 行首可能粘着电量/时间碎片："l78 IP 协议工作在哪一层?" → "IP 协议工作在哪一层?"
+    t = stripLeadingUiCrumb(t);
+    if (!t) continue;
+    // OCR 常把选项字母和正文粘在一起："B4.避拥塞控制导致速率骤降。"
+    // 拆成 "B. 4.避拥塞控制…" 交给 matchOption 处理
+    const glued = t.match(/^([A-J])(\d{1,2}\s*[.、．)）].*)$/);
+    if (glued) t = glued[1] + '. ' + glued[2];
+    out.push(t);
+  }
+  return out.join('\n');
+}
+
+/**
+ * 一条 a11y 文本 → 答案
+ * @param {string} text 整屏 a11y 文本（OCR 结果会被追加到后面）
+ * @param {object|null} preStructured 手机端区域抽取结果
+ * @param {string} ocrText OCR 识别出的文字（无图题时为空串）
+ */
+async function solve(text, preStructured, ocrText = '') {
   // 手机端 a11y 区域抽取优先；没有或解析失败才退回整屏文本解析
   let structured;
-  if (preStructured && (preStructured.stem || (preStructured.options || []).length)) {
+  const structStem = String(preStructured?.stem || '').trim();
+  const structOpts = (preStructured?.options || []).length;
+
+  // 图片题：手机端抽到了选项和题型，但题干为空 —— 题干是张图。
+  // 这时 structured 是个「有选项没题干」的空壳，必须让 OCR 文本接管题干，
+  // 否则模型只能拿选项硬猜（实测「IP 在哪一层」靠四个层名猜出 B，纯属运气）。
+  const imageStem = !!preStructured && !structStem && structOpts >= 2 && !!preStructured.typeLabel;
+
+  if (imageStem && ocrText) {
+    // 用 OCR 文本重新解析，选项以手机端抽到的为准（OCR 可能把选项读错）
+    const cleaned = cleanOcrText(ocrText);
+    console.log(`[image-question] OCR 清洗后 ${cleaned.length} chars:\n${cleaned.slice(0, 300)}`);
+    structured = parseScreen(cleaned);
+    if (structured.ok) {
+      // 手机端传的是字符串数组 ["A. 传输层", ...]，而 renderAnswer 要的是
+      // [{key:'A', text:'传输层'}, ...]。直接赋值会让 opts[i].text 取到
+      // undefined，叠层上只剩一个孤零零的 "C undefined"（实测）。
+      structured.primary.options = preStructured.options.map((s, i) => {
+        const raw = String(s || '').trim();
+        const m = raw.match(/^([A-J])\s*[.、．)）:：]\s*(.*)$/);
+        return m
+          ? { key: m[1], text: m[2].trim() }
+          : { key: String.fromCharCode(65 + i), text: raw };
+      });
+      structured.primary.typeLabel = preStructured.typeLabel;
+      structured.primary.type = detectType(structured.primary);
+      console.log(`[image-question] OCR 接管题干: "${String(structured.primary.stem || '').slice(0, 50)}" `
+        + `opts=${structured.primary.options.length}（沿用手机端）`);
+    } else {
+      console.log('[image-question] OCR 文本也没解析出题干，退回选项猜测');
+    }
+  } else if (preStructured && (structStem || structOpts)) {
     structured = parseStructured(preStructured);
     console.log(`[structured] stem="${String(structured.primary?.stem || '').slice(0, 40)}" `
       + `opts=${structured.primary?.options?.length || 0} type=${structured.primary?.type || '-'}`);
@@ -243,8 +305,13 @@ async function solve(text, preStructured) {
   }
 
   if (!structured.ok) {
+    // 非题目页（登录页/首页/课程列表/消息页）：不调模型、不入缓存、不糊叠层。
+    // 手机端收到 source=none 会显示"未识别到题目"并保持上一题答案不变。
+    const r = structured.rejected;
+    console.log(`[none] not a question page examPage=${structured.examPage}`
+      + (r ? ` candidate="${String(r.stem || '').slice(0, 40)}"` : ' (empty after clean)'));
     return {
-      answer: '未识别到题目（整屏文本清洗后为空）',
+      answer: '未识别到题目（当前页面不是答题页）',
       source: 'none',
       question: null,
       structured,
@@ -373,11 +440,12 @@ const server = http.createServer(async (req, res) => {
       } catch { text = body; }
       const t0 = Date.now();
       // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
+      let ocrText = '';
       if (image) {
-        const ocrText = await ocrImage(image);
+        ocrText = await ocrImage(image);
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
-      const r = await solve(text, structured);
+      const r = await solve(text, structured, ocrText);
       const from = req.socket.remoteAddress || '-';
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'} from=${from}`);
       return json(res, {

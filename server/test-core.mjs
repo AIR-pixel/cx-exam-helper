@@ -6,7 +6,7 @@
 import {
   normalizeLine, isNoise, cleanLines, matchOption, detectType, countBlanks,
   parseScreen, parseStructured, normalizeForHash, extractJson, lettersToIndices, parseAnswerText,
-  stripPrefix,
+  stripPrefix, looksLikeQuestion,
 } from './answer-core.mjs';
 
 let pass = 0, fail = 0;
@@ -317,6 +317,64 @@ eq('超长文本不炸', (() => { try { parseScreen('长'.repeat(50000)); return
   // 空输入不炸
   eq('结构化空输入', parseStructured({}).ok, false);
   eq('结构化 null', parseStructured(null).ok, false);
+}
+
+// ══════════════ 15. 题目页判定（非答题页不许打模型） ══════════════
+// 起因：学习通登录页清洗后只剩「我已阅读并同意…」，被当成一道无选项简答题
+// 送去模型，白烧一次调用还把"该内容并非课程题目"糊到叠层上。首页/课程列表同理。
+{
+  const notQuestion = [
+    ['登录页', '浏览模式\n客服\n登录\n手机号/超星号\n密码\n忘记密码?\n我已阅读并同意学习通《隐私政策》和《用户协议》\n新用户注册\n手机号快捷登录\n其他登录方式'],
+    ['首页课程列表', '首页\n消息\n课程\n我\n我的课程\n计算机网络\n高等数学\n大学英语\n查看全部'],
+    ['课程详情', '课程详情\n计算机网络\n教师：张老师\n章节\n第一章 概述\n第二章 物理层\n进入学习'],
+    ['签到页', '签到\n请点击签到\n签到时间 10:35\n剩余 00:58'],
+    ['消息列表', '消息\n系统通知\n作业提醒\n班级群\n张老师：明天上课'],
+    ['个人中心', '我的\n姓名\n学号\n设置\n退出登录\n关于我们'],
+  ];
+  for (const [name, text] of notQuestion) {
+    const r = parseScreen(text);
+    eq(`非题目页拒绝：${name}`, r.ok, false);
+    eq(`非题目页 primary=null：${name}`, r.primary, null);
+    eq(`非题目页 stableKey 空：${name}`, r.stableKey, '');
+    ok(`非题目页留 rejected 诊断：${name}`, r.rejected != null, JSON.stringify(r.rejected));
+  }
+
+  const yesQuestion = [
+    ['单选带选项', '1.（2分）\n单选题\n下列关于TCP三次握手的描述，正确的是\nA. 第一次握手由客户端发送SYN报文\nB. 第二次握手由服务端发送ACK报文'],
+    ['简答考试页', '简答题\n5.（10分）\n简述TCP与UDP的主要区别。\n交卷 答题卡 上一题 下一题'],
+    ['填空考试页', '填空题\n3.（4分）\nTCP首部固定长度是____字节。\n交卷 答题卡'],
+    ['判断考试页', '判断题\n2.（2分）\nTCP是面向连接的协议。\n交卷 答题卡'],
+    ['作业页问句', '下列关于进程与线程的说法，正确的是？\nA. 进程是资源分配单位\nB. 线程是调度单位'],
+  ];
+  for (const [name, text] of yesQuestion) {
+    eq(`真题目页放行：${name}`, parseScreen(text).ok, true);
+  }
+
+  // 考试页判定
+  eq('考试页标识', parseScreen('简答题\n简述TCP特点\n交卷 答题卡').examPage, true);
+  eq('非考试页标识', parseScreen('消息\n系统通知').examPage, false);
+
+  // 结构化路径同样拦截
+  eq('结构化拒登录页协议',
+    parseStructured({ stem: '我已阅读并同意学习通《隐私政策》和《用户协议》', options: [], typeLabel: '' }).ok,
+    false);
+  eq('结构化拒短标签', parseStructured({ stem: '设置', options: [], typeLabel: '' }).ok, false);
+  eq('结构化放行带标签简答',
+    parseStructured({ stem: '简述TCP与UDP的主要区别。', options: [], typeLabel: '简答题' }).ok, true);
+
+  // looksLikeQuestion 直接判据
+  eq('判据：null', looksLikeQuestion(null), false);
+  eq('判据：空 stem', looksLikeQuestion({ stem: '', options: [] }), false);
+  eq('判据：2 选项即成立', looksLikeQuestion({ stem: 'x', options: [{ key: 'A', text: '1' }, { key: 'B', text: '2' }] }), true);
+  eq('判据：typeLabel 即成立', looksLikeQuestion({ stem: 'x', options: [], typeLabel: '单选题' }), true);
+  eq('判据：短标签拒绝', looksLikeQuestion({ stem: '设置', options: [] }), false);
+  eq('判据：界面标签考试页也拒绝', looksLikeQuestion({ stem: '设置', options: [] }, { examPage: true }), false);
+  eq('判据：短题干考试页放行', looksLikeQuestion({ stem: '简述TCP特点', options: [] }, { examPage: true }), true);
+  eq('判据：分值行', looksLikeQuestion({ stem: '3.（2分）计算题内容', options: [] }), true);
+  eq('判据：空位行', looksLikeQuestion({ stem: 'TCP长度是____字节', options: [] }), true);
+  // 回归：裸"计算"曾把课程名「计算机网络」判成题干
+  eq('判据：课程名不误判', looksLikeQuestion({ stem: '计算机网络', options: [] }), false);
+  eq('判据：数据分析不误判', looksLikeQuestion({ stem: '数据分析', options: [] }), false);
 }
 
 // ══════════════ 报告 ══════════════

@@ -68,7 +68,12 @@ public final class AnswerOverlay {
     // ─────────────────────── 挂载 ───────────────────────
 
     public void show() {
-        h.post(new Runnable() { public void run() { showInner(); } });
+        h.post(new Runnable() { public void run() {
+            showInner();
+            // 重新挂载后把当前答案填回去（hide→show 之间 Bus 里的值可能已经更新）
+            Bus.Msg cur = Bus.last();
+            if (cur != null && attached) render(cur);
+        } });
     }
 
     private void showInner() {
@@ -118,9 +123,9 @@ public final class AnswerOverlay {
                     WindowManager.LayoutParams.WRAP_CONTENT);
             wm.addView(card, lp);
             attached = true;
-
-            Bus.Msg cur = Bus.last();
-            if (cur != null) render(cur);
+            // 这里不主动回填 Bus.last()：render() 在未挂载时会调 showInner()，
+            // 若 showInner 再回填就会递归。回填统一由调用方（Bus listener /
+            // render 自身）负责，showInner 只负责把 View 树搭起来。
         } catch (Throwable t) {
             android.util.Log.e("AnswerOverlay", "addView failed: " + t, t);
         }
@@ -157,6 +162,12 @@ public final class AnswerOverlay {
 
     public void render(final Bus.Msg m) {
         h.post(new Runnable() { public void run() {
+            // 未挂载时先挂上再渲染。
+            // 图片题 OCR 必须先把叠层 hide 掉才能截到干净像素，hide 之后
+            // 答案才回来 —— 此时 attached 还是 false，早年的 `return` 会把
+            // 答案整个丢掉，叠层恢复后只剩初始占位文本（实测截图里
+            // 「a11y 已连接」和 meta 叠印、答案正文消失）。
+            if (!attached || card == null) showInner();
             if (!attached || card == null) return;
 
             String type = m.type == null ? "" : m.type;

@@ -67,6 +67,15 @@ public class MockExam extends Activity {
             "5.（5分）简述为什么 UDP 不保证可靠传输却仍然被大量实时业务采用。",
             null, null, null, null
         },
+        {
+            // 图片题：题干整张是图片，a11y 读不到任何题干文字。
+            // 这是验证 OCR 兜底链路的唯一场景 —— 前五题都有可读文字，
+            // 走的是 a11y 主链路，永远不会触发 handleWithOcr。
+            "single",
+            "单选题",
+            null,          // stem=null → 渲染成 <img>，不产生文本节点
+            "A. 传输层", "B. 网络层", "C. 数据链路层", "D. 物理层"
+        },
     };
 
     @Override
@@ -124,7 +133,19 @@ public class MockExam extends Activity {
 
         // 题型标签单独成行（学习通就是这么渲染的，题号/分值也各占一行）
         h.append("<div class=\"questype\">").append(q[1]).append("</div>");
-        h.append("<div class=\"questionWrap\">").append(esc(q[2])).append("</div>");
+
+        if (q[2] == null) {
+            // 图片题：题干画成 SVG 图片塞进 <img>。
+            // 关键约束：图片里的文字对 a11y 完全不可见（alt 也故意留空），
+            // 只有 OCR 能读出来 —— 这才叫真的图片题。
+            h.append("<div class=\"questionWrap\">");
+            h.append("<img class=\"stemimg\" alt=\"\" style=\"width:100%;max-width:1000px\" src=\"")
+             .append(svgDataUri("6.（2分）IP 协议工作在哪一层？"))
+             .append("\">");
+            h.append("</div>");
+        } else {
+            h.append("<div class=\"questionWrap\">").append(esc(q[2])).append("</div>");
+        }
 
         if (q[3] != null) {
             String cls = "multi".equals(q[0]) ? "multioption"
@@ -156,5 +177,31 @@ public class MockExam extends Activity {
 
     private static String esc(String s) {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /**
+     * 把一段文字画成 SVG 图片，返回 data URI。
+     *
+     * 为什么要绕这一圈：图片题必须让题干文字只存在于像素里。
+     * 直接用 <img src="...png"> 需要打包图片资源，而 SVG data URI 能在
+     * 纯 HTML 字符串里生成任意文字，且渲染后对 a11y 只暴露一个无文字的
+     * image 节点（alt=""），OCR 才有活干。
+     */
+    private static String svgDataUri(String text) {
+        String svg = "<svg xmlns='http://www.w3.org/2000/svg' width='1000' height='120'>"
+                + "<rect width='1000' height='120' fill='#ffffff'/>"
+                + "<text x='20' y='72' font-family='sans-serif' font-size='40' fill='#111111'>"
+                + escXml(text) + "</text></svg>";
+        try {
+            return "data:image/svg+xml;charset=utf-8,"
+                    + java.net.URLEncoder.encode(svg, "UTF-8").replace("+", "%20");
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String escXml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("'", "&apos;").replace("\"", "&quot;");
     }
 }

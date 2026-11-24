@@ -48,6 +48,53 @@ const DYNAMIC_CHROME = /^(剩余时间|倒计时|时间|考试用时)[:：\s]*[\
 // OCR 会把状态栏裸时间（"10:35"）和置信度碎片（"0.94"）读进来，也滤掉
 const OCR_NOISE = /^\d{1,2}:\d{2}(:\d{2})?$|^\d\.\d{2}$/;
 
+// 状态栏 / 标题栏 / 系统 toast 的 OCR 碎片。
+// 实测一张 1080x2400 截图，RapidOCR 前几行全是这些东西：
+//   "3.08"（电量小数）、"9:30"（时间）、"(77"（电量图标）、"KB/s"（网速）、
+//   "Exam Mock"（Activity 标题）、"a11y 已连接·Vol+×2弹窗"（叠层底栏）。
+// 它们位置在题干上方，会被当成题干的开头拼进去，必须逐条滤掉。
+const OCR_UI_NOISE = [
+  /^\d{1,2}[:：]\d{2}$/,                       // 9:30
+  /^\d{1,2}\.\d{1,2}$/,                        // 3.08
+  /^[（(]?\d{1,3}[）)]?$/,                     // (77 / 77 —— 电量、信号
+  /^(?:KB|MB|GB)\/s$/i,                        // 网速
+  /^\d+(?:\.\d+)?\s*(?:KB|MB|GB)\/s$/i,
+  /^(?:5G|4G|3G|LTE|VoLTE|WiFi|WLAN)$/i,       // 网络制式
+  /^(?:Exam Mock|答案助手|答案)$/,               // Activity 标题
+  /a11y\s*已连接/,                              // 叠层底栏
+  /Vol[+＋]?\s*[×x]\s*2/,                       // 叠层提示
+  /超级用户权限/,                                // Magisk toast
+  /^(?:Shell|su)\s*(?:已|获得)/,
+  /^[·．.\-—_=~]{2,}$/,                         // 纯符号
+  // 电量/信号图标被 OCR 读成的数字串："l78" "￥578" "￥78" "€78" "l7B"
+  // 实测同一道图片题因此生成了 4 个不同 qkey（l78 / ￥578 / ￥78 / 干净版），
+  // 缓存命中率被这堆碎片拉低，还会污染题库。
+  // 注意 l/I/1/| 是电量图标竖条，不是字母，必须一起算进碎片。
+  /^[^\u4e00-\u9fa5A-Za-z]{0,2}[lI|]?\d{1,3}[A-Za-z]?$/,
+];
+
+/**
+ * 行首的状态栏碎片剥离（不是整行丢弃）。
+ *
+ * OCR 常把电量/时间粘在题干前面："l78 IP 协议工作在哪一层?"
+ * 整行丢会丢掉真题干，所以这里只剥前缀。
+ */
+const LEADING_UI_CRUMB = /^\s*(?:[^\u4e00-\u9fa5A-Za-z0-9]{0,3}[lI|]?\d{1,3}[A-Za-z]?|\d{1,2}[:：]\d{2})\s+(?=[\u4e00-\u9fa5A-Za-z])/;
+
+/** 该行是不是状态栏/标题栏/toast 噪声（OCR 专用） */
+export function isOcrUiNoise(line) {
+  const t = String(line || '').trim();
+  if (!t) return true;
+  if (OCR_NOISE.test(t)) return true;
+  for (const re of OCR_UI_NOISE) if (re.test(t)) return true;
+  return false;
+}
+
+/** 剥掉行首粘住的状态栏碎片（"l78 IP 协议…" → "IP 协议…"） */
+export function stripLeadingUiCrumb(line) {
+  return String(line || '').replace(LEADING_UI_CRUMB, '');
+}
+
 // ── 行首前缀：题号 / 分值 / 题型标签（可连续叠加，如 "3.（2分）单选题"）──
 const TYPE_WORDS = '单选题|多选题|判断题|填空题|简答题|名词解释|论述题|计算题|分析题|综合题|完形填空|阅读理解|连线题|排序题|听力题|材料题|共用选项题|不定项选择题';
 
@@ -132,6 +179,7 @@ export function isNoise(line) {
   if (SEPARATORS.test(line)) return true;
   if (UI_CHROME.has(line)) return true;
   if (DYNAMIC_CHROME.test(line) || OCR_NOISE.test(line)) return true;
+  if (isOcrUiNoise(line)) return true;
   for (const re of NOISE_RES) if (re.test(line)) return true;
   // 整行只是题号/分值/题型标签的叠加 → 装饰
   if (stripPrefix(line) === '') return true;
@@ -245,6 +293,107 @@ export function detectType(q) {
   return 'short';
 }
 
+// ─────────────────────────── 题目页判定 ───────────────────────────
+
+/**
+ * 考试页界面元素。出现任意一个，说明当前这一屏确实是考试/作业答题页，
+ * 题干判据可以放宽（考试页里不可能有"登录""客服"这类页面）。
+ */
+const EXAM_CHROME_RE = /(交卷|答题卡|上一题|下一题|剩余时间|倒计时|保存[^\n]{0,6}提交|提交试卷|共\s*\d+\s*题)/;
+
+/**
+ * 纯界面标签（导航项/按钮/菜单）。这些词在考试页里也可能出现
+ * （右上角"设置"、底部"退出登录"），不能因为"当前是考试页"就当题干。
+ */
+const UI_LABEL_RE = /^(设置|退出登录|关于我们|个人中心|我的|首页|消息|课程|返回|更多|分享|收藏|举报|帮助|客服|反馈|版本|隐私|协议|通知|公告|搜索|筛选|排序|编辑|删除|确认|取消|关闭|完成|提交|保存|上传|下载|刷新|重试|登录|注册)$/;
+const QUESTION_HINTS = [
+  /[?？]\s*$/,                                                    // 问句
+  /(下列|以下|如下|下面)[^\n]{0,16}(哪|什|怎|是否|属于|正确|错误|符合|包括|不属于)/,
+  /(关于|对于)[^\n]{0,24}(说法|描述|表述|叙述|理解|解释|判断|概念)[^\n]{0,8}(正确|错误|是|的是|有)/,
+  // 题干动词只收「不可能出现在课程名/导航里的」。
+  // 裸"计算/分析/比较/说明/解释"会把「计算机网络」「数据分析」这类课程名
+  // 误判成题干（实测踩过：首页课程列表里的"计算机网络"命中裸"计算"）。
+  /(简述|简答|试述|论述|阐述|名词解释|问答|默写|背诵)/,
+  /(计算|分析|比较|说明|解释|判断|求解|证明|推导)(并|下列|以下|下题|该|此|其|：|:)/,
+  /(单选题|多选题|判断题|填空题|简答题|不定项)/,
+  /[（(]\s*\d+(\.\d+)?\s*分\s*[)）]/,                              // 带分值
+  /_{2,}|（\s{2,}）|\(\s{2,}\)/,                                   // 填空空位
+  /^\s*第\s*\d{1,3}\s*题/,
+];
+
+/**
+ * 整屏无选项时，判断「这一屏」像不像一道题。
+ *
+ * 关键：splitQuestions 在无选项时会把**整屏所有行**用空格拼成一个 stem。
+ * 首页/课程列表/课程详情页拼出来有几十个字，长度判据完全失效
+ * （实测"首页 消息 课程 我 我的课程 计算机网络…"被判成简答题）。
+ *
+ * 所以不能看拼接后的总长度，要看**单行**：真正的一道题，题干本身
+ * （或题干被拆成的某一行）会命中问句/分值/空位/题干动词；
+ * 而导航页的每一行都是 2–6 字的界面标签，一行都不命中。
+ *
+ * @param {string} stem 拼接后的 stem
+ * @param {boolean} examPage 当前屏是否带考试界面元素
+ * @returns {boolean}
+ */
+function stemLooksLikeQuestion(stem, examPage) {
+  const s = String(stem || '').trim();
+  if (!s) return false;
+
+  // 题干被 a11y 拆成多行、再用空格拼回来，所以按「多字词块」逐段检查
+  const segments = s.split(/\s+/).filter((x) => x.length >= 4);
+  const probe = segments.length ? segments : [s];
+
+  // 1. 任意一段命中题干特征 → 是题
+  //    阈值放到 4 字：中文题干被 a11y 拆行后，"简述TCP特点"这种 7 字段很常见，
+  //    用 8 字门槛会把真题漏掉；而导航标签（"计算机网络""课程详情"）虽也 4–6 字，
+  //    但一个题干特征都命中不了，靠下面的特征正则排除。
+  for (const seg of probe) {
+    if (seg.length < 4) continue;
+    for (const re of QUESTION_HINTS) if (re.test(seg)) return true;
+  }
+
+  // 2. 考试页：有实质内容就算题（考试页不可能出现导航列表）
+  if (examPage) {
+    // 纯界面标签不算（考试页右上角也有"设置"，底部也有"退出登录"）
+    if (UI_LABEL_RE.test(s)) return false;
+    const substantive = segments.filter((x) => x.length >= 4).length;
+    return substantive > 0 || s.length >= 12;
+  }
+  return false;
+}
+
+/**
+ * 这一屏到底是不是一道题（而不是登录页 / 首页 / 课程列表 / 消息页）。
+ *
+ * 为什么必须判：a11y 会把当前前台应用的**任意**页面都读进来。学习通登录页
+ * 清洗后还剩一行「我已阅读并同意学习通《隐私政策》和《用户协议》」，被
+ * splitQuestions 当成一道无选项简答题送去模型 —— 白烧一次调用，还把
+ * "该内容并非课程题目"这种废话糊到叠层上。首页、课程列表、消息页同理。
+ *
+ * 判据按可信度从高到低：
+ *   1. 有 ≥2 个选项        → 选择题，一定是题
+ *   2. 有题型标签          → 题型标签只出现在题目页
+ *   3. 页面带考试界面元素  → 考试页，放宽到"有内容就算题"
+ *   4. 题干命中问句/分值/空位等特征
+ *
+ * @param {{stem?:string, options?:Array, typeLabel?:string}} q
+ * @param {{examPage?:boolean}} [opts]
+ * @returns {boolean}
+ */
+export function looksLikeQuestion(q, opts = {}) {
+  if (!q) return false;
+  const stem = String(q.stem || '').trim();
+  const options = Array.isArray(q.options) ? q.options : [];
+
+  if (options.length >= 2) return true;
+  if (q.typeLabel) return true;
+  if (!stem) return false;
+
+  // 逐行/逐段判，不看拼接总长（导航页拼起来也很长）
+  return stemLooksLikeQuestion(stem, opts.examPage);
+}
+
 /** 填空题空位数 */
 export function countBlanks(stem) {
   const s = String(stem || '');
@@ -356,14 +505,24 @@ export function parseScreen(text, opts = {}) {
   // stableKey：题干+选项的稳定哈希，不受滚动/可见节点变化影响。
   // 手机端用它判断"是不是同一道题"，替代整屏 screenHash。
   const stableKey = questions.length ? normalizeForHash(questions[0]) : '';
+
+  // 题目页判定：不是题就把 questions 清空，让上层走 source=none，
+  // 不去调模型、不污染缓存、不在叠层上糊废话。
+  const examPage = EXAM_CHROME_RE.test(String(text == null ? '' : text));
+  const isQuestion = questions.length > 0 && looksLikeQuestion(questions[0], { examPage });
+  const kept = isQuestion ? questions : [];
+
   return {
-    ok: questions.length > 0,
+    ok: kept.length > 0,
     mode: opts.mode || 'unknown',
-    questions,
-    primary: questions[0] || null,
+    questions: kept,
+    primary: kept[0] || null,
     screenHash,
-    stableKey,
+    stableKey: kept.length ? stableKey : '',
     lineCount: lines.length,
+    // 诊断用：被判定为非题目时保留候选，方便排查误杀
+    rejected: isQuestion ? null : (questions[0] || null),
+    examPage,
   };
 }
 
@@ -392,14 +551,23 @@ export function parseStructured(s) {
   const screenHash = createHash('sha1').update(stem + '|' + options.map((o) => o.text).join('\n'))
     .digest('hex').slice(0, 16);
   const stableKey = normalizeForHash(q);
+
+  // 结构化路径同样要判：手机端区域抽取在非题目页也会抽到一行"stem"
+  // （比如登录页的协议声明），照旧送模型就白烧额度。
+  const examPage = !!s?.examPage;
+  const isQuestion = looksLikeQuestion(q, { examPage });
+  const kept = isQuestion ? [q] : [];
+
   return {
-    ok: !!stem || options.length > 0,
+    ok: kept.length > 0,
     mode: 'structured',
-    questions: [q],
-    primary: q,
+    questions: kept,
+    primary: kept[0] || null,
     screenHash,
-    stableKey,
+    stableKey: kept.length ? stableKey : '',
     lineCount: 1 + options.length,
+    rejected: isQuestion ? null : q,
+    examPage,
   };
 }
 

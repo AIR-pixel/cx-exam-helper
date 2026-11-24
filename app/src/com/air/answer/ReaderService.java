@@ -43,10 +43,39 @@ public class ReaderService extends AccessibilityService {
     private long lastVolDownDownAt = 0;
     private long lastToggleAt = 0;
 
+    /**
+     * 答题页专属界面元素。只出现在考试/作业答题页，
+     * 登录页、首页、课程列表、消息页、个人中心都没有。
+     * 用来把 OCR 兜底限制在真正的答题页上。
+     */
+    private static final java.util.regex.Pattern EXAM_CHROME = java.util.regex.Pattern.compile(
+            "交卷|答题卡|上一题|下一题|剩余时间|倒计时|提交试卷|保存\\s*提交|共\\s*\\d+\\s*题");
+
+    /**
+     * 题干标记：行首题号（"5." "第5题"）或行内分值（"（5分）"）。
+     * 带这两种标记的行一定是题干，哪怕字数不到 8 也收 —— 用长度门槛会把
+     * "5.（5分）简述为什么…"（12 字）之外的短题干误杀。
+     */
+    private static final java.util.regex.Pattern STEM_MARK = java.util.regex.Pattern.compile(
+            "^\\s*(?:第\\s*\\d{1,3}\\s*题|\\d{1,3}\\s*[.、．)）])|[(（]\\s*\\d+(?:\\.\\d+)?\\s*分\\s*[)）]");
+
     private final Handler h = new Handler(Looper.getMainLooper());
     private Runnable pending;
     private String lastScreenHash = "";
     private volatile boolean inFlight = false;
+    /** 上一次打日志时的整屏文本，用来压掉滚动/倒计时造成的重复日志 */
+    private String lastLoggedText = "";
+    /** 扫描链代次：每次 scheduleScan 递增，旧链的下一跳发现代数变了就退出 */
+    private int scanGen = 0;
+    /** 请求在飞时被丢弃的扫描请求；请求结束后补跑，避免慢响应吞掉下一题 */
+    private volatile boolean deferredScan = false;
+    /** 周期性兜底扫描（图片题不产生 a11y 事件，只能靠轮询） */
+    private boolean pollRunning = false;
+    private Runnable pollTick;
+    /** 轮询间隔：够短能跟上翻页，够长不烧电 */
+    private static final long POLL_MS = 2500;
+    /** 上一次做 OCR 时的 a11y 文本，用于同一屏去重（避免反复 hide/show 闪屏） */
+    private String lastOcrA11yText = "";
 
     private AnswerOverlay overlay;
     private Bus.Listener busListener;
@@ -95,6 +124,9 @@ public class ReaderService extends AccessibilityService {
                 && t != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                 && t != AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) return;
         scheduleScan();
+        // 考试页启动周期兜底扫描：图片题换页不产生任何 a11y 文本变化事件，
+        // 只靠事件驱动会彻底静默（实测从简答题翻到图片题，日志一条都没有）。
+        if (!pollRunning && isExamPage(readAllWindows())) startPoll();
     }
 
     /**
@@ -143,13 +175,70 @@ public class ReaderService extends AccessibilityService {
 
     private void scheduleScan() {
         if (pending != null) h.removeCallbacks(pending);
+        // 作废正在跑的重试链（它内部的下一跳靠 scanGen 自杀）
+        scanGen++;
         pending = new Runnable() { public void run() { pending = null; scan(); } };
         h.postDelayed(pending, DEBOUNCE_MS);
     }
 
     private void scan() {
-        if (inFlight) return;
+        if (inFlight) {
+            // 关键：不能静默丢帧。
+            // 模型响应慢（实测 qoder 3.5~5s）时 inFlight 长时间为 true，
+            // 用户在这期间翻到下一题，scheduleScan 排的那一跳到这里就被 return 掉，
+            // 而请求结束后没有任何机制重扫 —— 下一题永远读不到。
+            // 图片题尤其明显：翻页后 a11y 事件只来一次，丢了就彻底静默。
+            // 所以挂一个补偿扫描，等请求结束后再跑一次。
+            Log.d(TAG, "scan deferred: request in flight");
+            deferredScan = true;
+            return;
+        }
         attempt(0);
+    }
+
+    /** 请求结束后调用：如果有被推迟的扫描，补跑一次 */
+    private void flushDeferredScan() {
+        if (!deferredScan) return;
+        deferredScan = false;
+        Log.d(TAG, "flush deferred scan");
+        scheduleScan();
+    }
+
+    /**
+     * 周期性兜底扫描。
+     *
+     * 为什么必须有：图片题的题干是张 <img>，翻页时 DOM 里**没有任何文本节点
+     * 发生变化**，a11y 的 TYPE_WINDOW_CONTENT_CHANGED 根本不触发。
+     * 实测：从第 5 题（简答）点「下一题」到第 6 题（图片题）后，
+     * AnsReader 一条日志都没有 —— 扫描器压根没被唤醒，OCR 链路自然也没机会跑。
+     * 学习通的真实图片题同样如此。
+     *
+     * 只在考试页轮询（靠 EXAM_CHROME 判据），非答题页不烧 CPU 也不截屏。
+     */
+    private void startPoll() {
+        if (pollRunning) return;
+        pollRunning = true;
+        pollTick = new Runnable() { public void run() {
+            if (!pollRunning) return;
+            if (!ToggleStore.appOn()) { stopPoll(); return; }
+            // 只在最近一次读到的是答题页时才继续轮询
+            String t = readAllWindows();
+            if (isExamPage(t)) {
+                Log.d(TAG, "poll tick (exam page, chars=" + t.length() + ")");
+                scan();
+            } else {
+                Log.d(TAG, "poll stop: not an exam page");
+                stopPoll();
+                return;
+            }
+            h.postDelayed(pollTick, POLL_MS);
+        } };
+        h.postDelayed(pollTick, POLL_MS);
+    }
+
+    private void stopPoll() {
+        pollRunning = false;
+        if (pollTick != null) { h.removeCallbacks(pollTick); pollTick = null; }
     }
 
     /**
@@ -160,17 +249,39 @@ public class ReaderService extends AccessibilityService {
      * 需要等 WebView 完成首帧布局 + 无障碍节点构建，内容才挂上去。
      * 判据用「有选项标记或题干特征」，而不是简单的长度阈值 —— 长度 6
      * 用标题栏就能满足，会导致读到空壳就去问模型。
+     *
+     * 为什么带 gen：scheduleScan 只能取消**还没跑**的 pending Runnable，
+     * 已经跑起来的那条重试链（内部 h.postDelayed 排的下一跳）取消不掉。
+     * 登录页的 windowContentChanged 一秒来好几次，于是多条链同时跑，
+     * 日志里出现 attempt#3/#5/#1 乱序交错，也浪费 CPU。
+     * 每开一条新链就 ++scanGen，旧链的下一跳发现代数变了直接退出。
      */
     private void attempt(final int n) {
-        if (inFlight) return;
+        attempt(n, scanGen);
+    }
+
+    private void attempt(final int n, final int gen) {
+        if (gen != scanGen) return;          // 这条链已被更新的扫描取代
+        if (inFlight) { deferredScan = true; return; }
         String text = readAllWindows();
         boolean usable = looksLikeQuestion(text);
+        // 图片题：页面上有选项和题型，但题干一个字都没有。
+        // a11y 只能读到选项 —— 题干是张图，文字全在像素里。
+        // 这种页面 looksLikeQuestion 返回 true（选项≥2），于是永远走不到
+        // OCR 兜底，模型只能靠选项硬猜（实测第 6 题「IP 在哪一层」靠
+        // A.传输层/B.网络层/C.数据链路层/D.物理层 猜出 B，答案对但纯属运气）。
+        boolean imageStem = usable && isImageQuestion();
 
-        Log.d(TAG, "attempt#" + n + " windows=" + windowCount()
-                + " chars=" + text.length() + " usable=" + usable);
+        // 只在内容变化时打日志：WebView 滚动/倒计时会每秒刷几十条，日志会淹掉证据
+        if (!text.equals(lastLoggedText)) {
+            lastLoggedText = text;
+            Log.d(TAG, "attempt#" + n + " windows=" + windowCount()
+                    + " chars=" + text.length() + " usable=" + usable
+                    + (imageStem ? " imageStem=true" : ""));
+        }
 
         if (!usable && n < MAX_ATTEMPTS) {
-            h.postDelayed(new Runnable() { public void run() { attempt(n + 1); } },
+            h.postDelayed(new Runnable() { public void run() { attempt(n + 1, gen); } },
                     RETRY_STEP_MS);
             return;
         }
@@ -178,10 +289,62 @@ public class ReaderService extends AccessibilityService {
             Log.d(TAG, "give up after " + n + " attempts, last="
                     + text.replace('\n', '|'));
             // 图片题兜底：a11y 读不到文字 → root screencap → PC OCR
-            if (ToggleStore.appOn()) handleWithOcr(text);
+            // 但必须先过页面闸门：登录页/首页/toast 也会走到这里，
+            // 不过闸就会把整屏截图上送模型，烧额度还糊一屏废话。
+            if (ToggleStore.appOn() && isExamPage(text)) {
+                handleWithOcr(text);
+            } else {
+                Log.d(TAG, "OCR fallback skipped: not an exam page");
+                Bus.publishStatus("未识别到题目（当前不是答题页）", "off");
+            }
+            return;
+        }
+        // 有选项但没题干 → 图片题，走 OCR 而不是让模型猜选项
+        if (imageStem && ToggleStore.appOn()) {
+            Log.d(TAG, "image question: options without stem, use OCR");
+            handleWithOcr(text);
             return;
         }
         handleText(text);
+    }
+
+    /**
+     * 当前屏是不是「有选项但题干是图片」。
+     *
+     * 判据：readStructured() 抽出的 stem 为空，但选项 ≥2 且有题型标签。
+     * 为什么不能只看「stem 为空」：作业页/答题卡页也可能只有选项没题干，
+     * 那种页面没有题型标签，不该截屏。三个条件同时成立才认定图片题。
+     */
+    private boolean isImageQuestion() {
+        try {
+            String s = readStructured();
+            if (s == null || s.isEmpty()) return false;
+            org.json.JSONObject j = new org.json.JSONObject(s);
+            String stem = j.optString("stem", "").trim();
+            org.json.JSONArray arr = j.optJSONArray("options");
+            int opts = arr == null ? 0 : arr.length();
+            String typeLabel = j.optString("typeLabel", "").trim();
+            return stem.isEmpty() && opts >= 2 && !typeLabel.isEmpty();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 当前屏是不是答题页。
+     *
+     * 判据：出现考试页专属的界面元素（交卷/答题卡/上一题/下一题/剩余时间/共N题）。
+     * 这些文案只在考试/作业答题页出现，登录页、首页、课程列表、消息页都没有。
+     *
+     * 为什么 OCR 兜底必须过这道闸：a11y 会把前台应用的任意页面都读进来。
+     * 实测学习通登录页清洗后只剩「我已阅读并同意学习通《隐私政策》和《用户协议》」，
+     * looksLikeQuestion 正确地判了 false，但 OCR 兜底没再校验，直接把 210KB
+     * 截屏送进模型，模型回了一段"该内容并非课程题目"糊到叠层上 —— 白烧一次调用。
+     * 同理「跳过1s」这类 toast 也会触发。
+     */
+    private static boolean isExamPage(String t) {
+        if (t == null || t.isEmpty()) return false;
+        return EXAM_CHROME.matcher(t).find();
     }
 
     /** 够不够像一道题：出现选项字母标记，或出现分值/空号/题号特征 */
@@ -297,18 +460,78 @@ public class ReaderService extends AccessibilityService {
      */
     private void handleWithOcr(final String a11yText) {
         if (inFlight) return;
+        // 同一屏不重复截屏 OCR。
+        // 轮询每 2.5s 一跳，若每次都 hide→screencap→show，叠层会不停闪，
+        // 而且 hide/show 是 UI 线程异步的，交错执行会让叠层停在隐藏状态
+        // （实测 OVERLAY[not-attached]）。图片题的选项本身在 a11y 里可读，
+        // 所以「a11y 文本没变 + 已经答过」就足以判定是同一题，直接跳过。
+        if (a11yText != null && a11yText.equals(lastOcrA11yText) && !lastScreenHash.isEmpty()) {
+            Log.d(TAG, "OCR skip: same a11y text, already answered");
+            // 跳过 OCR 不等于什么都不做：上一轮 hide 掉的叠层必须重新挂上，
+            // 否则会一直停在隐藏状态（实测 OVERLAY[not-attached]）。
+            if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.show();
+            return;
+        }
+        lastOcrA11yText = a11yText;
         inFlight = true;
         new Thread(new Runnable() { public void run() {
             try {
-                String img = captureScreenBase64();
+                // 截屏前必须先把叠层藏起来。
+                // screencap 是像素级抓取，会把 TYPE_ACCESSIBILITY_OVERLAY 窗口
+                // 一起拍进去 —— 上一题的答案卡片正好盖在题干上，OCR 读到的
+                // 就是自己刚给出的答案，等于自问自答（实测：图片题读到的是
+                // 上一道 UDP 简答题的 A/B/C/D 论述，真题干只露出半行）。
+                // SKIP_SCREENSHOT 只影响 MediaProjection/系统截屏，不影响 root
+                // screencap，所以这里必须显式 hide。
+                // 必须用 latch 等 hide 真正跑完：hide() 只是 post 到 UI 线程，
+                // 立刻 screencap 会拍到叠层残影（实测 950KB 那张就是残影）。
+                final boolean wasShown = overlay != null && ToggleStore.overlayOn();
+                if (wasShown) {
+                    final java.util.concurrent.CountDownLatch done =
+                            new java.util.concurrent.CountDownLatch(1);
+                    h.post(new Runnable() { public void run() {
+                        try { overlay.hide(); } finally { done.countDown(); }
+                    } });
+                    try { done.await(2, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    // 窗口移除到 SurfaceFlinger 真正合成完还有一点延迟
+                    try { Thread.sleep(250); } catch (InterruptedException ignored) { }
+                }
+                String img;
+                try {
+                    img = captureScreenBase64();
+                } finally {
+                    // 无论截图成功与否都要把叠层放回去
+                    if (wasShown) {
+                        final java.util.concurrent.CountDownLatch back =
+                                new java.util.concurrent.CountDownLatch(1);
+                        h.post(new Runnable() { public void run() {
+                            try {
+                                if (ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.show();
+                            } finally { back.countDown(); }
+                        } });
+                        try { back.await(2, java.util.concurrent.TimeUnit.SECONDS); }
+                        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    }
+                }
                 if (img == null || img.isEmpty()) {
                     Log.w(TAG, "OCR fallback: screencap failed");
                     Bus.publishStatus("图片题：截屏失败（需 root）", "error");
                     return;
                 }
                 Log.d(TAG, "OCR fallback: sending " + (img.length() / 1024) + "KB image");
-                Answer a = askPC(a11yText == null ? "" : a11yText, img);
+                // 把区域抽取结果一起上送：服务端靠「有选项无题干」判定这是图片题，
+                // 才能让 OCR 文本接管题干，而不是拿空壳 structured 覆盖掉 OCR。
+                String struct = readStructured();
+                Answer a = askPC(a11yText == null ? "" : a11yText, img,
+                        struct == null ? "" : struct);
                 if (a == null) return;
+                // 服务端二次判定为非题目（图片里其实也不是题）：不糊叠层
+                if ("none".equals(a.source)) {
+                    Log.d(TAG, "OCR fallback: server says not a question, drop");
+                    Bus.publishStatus("未识别到题目", "off");
+                    return;
+                }
                 String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
                 if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
                     Log.d(TAG, "OCR fallback skip same question " + dedupKey);
@@ -319,6 +542,7 @@ public class ReaderService extends AccessibilityService {
                 Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
             } finally {
                 inFlight = false;
+                flushDeferredScan();   // 请求期间翻页了 → 补扫一次
             }
         } }).start();
     }
@@ -360,6 +584,12 @@ public class ReaderService extends AccessibilityService {
             try {
                 Answer a = askPC(q, null, structured);
                 if (a == null) return;
+                // 服务端判定为非题目（题干清洗后只剩页面装饰）：不糊叠层、不占去重位
+                if ("none".equals(a.source)) {
+                    Log.d(TAG, "server says not a question, drop (kept last=" + lastScreenHash + ")");
+                    Bus.publishStatus("未识别到题目", "off");
+                    return;
+                }
                 // 去重键优先用 stableKey（题干+选项哈希，滚动不变），
                 // 没有时才退回整屏 screenHash（老版 PC 服务兼容）。
                 String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
@@ -383,6 +613,7 @@ public class ReaderService extends AccessibilityService {
                 } }, 400);
             } finally {
                 inFlight = false;
+                flushDeferredScan();   // 请求期间翻页了 → 补扫一次
             }
         } }).start();
     }
@@ -512,8 +743,11 @@ public class ReaderService extends AccessibilityService {
     private static final class TextNode {
         final String text;
         final int top, bottom, left;
-        TextNode(String text, int top, int bottom, int left) {
-            this.text = text; this.top = top; this.bottom = bottom; this.left = left;
+        /** 是否是可编辑输入框（EditText）。输入框的 text 是 hint，不是题干 */
+        final boolean editable;
+        TextNode(String text, int top, int bottom, int left, boolean editable) {
+            this.text = text; this.top = top; this.bottom = bottom;
+            this.left = left; this.editable = editable;
         }
     }
 
@@ -551,7 +785,9 @@ public class ReaderService extends AccessibilityService {
         if (!s.isEmpty() && seen.add(s)) {
             android.graphics.Rect r = new android.graphics.Rect();
             n.getBoundsInScreen(r);
-            out.add(new TextNode(s, r.top, r.bottom, r.left));
+            // 标出输入框：简答题的 EditText 把 hint「在此输入你的答案」当 text 报上来，
+            // 长度 9 字能过 stem 的长度门槛，反而把真正的题干挤掉（实测踩过）。
+            out.add(new TextNode(s, r.top, r.bottom, r.left, n.isEditable()));
         }
         int cnt = Math.min(n.getChildCount(), 300);
         for (int i = 0; i < cnt; i++) collectNodes(n.getChild(i), out, seen, depth + 1);
@@ -583,13 +819,30 @@ public class ReaderService extends AccessibilityService {
 
         // 3. 题干：在题型标签之后、第一个选项之前的较长文本
         //    剔除 UI 噪声（倒计时/工具栏/按钮/题号分值单独行）
+        //
+        //    选择规则分两档，不能只取"最靠下的长文本"：
+        //    简答题的答题框占位文字「在此输入你的答案」比真题干更靠下、
+        //    长度 9 也过了 8 字门槛，单靠 y 排序会把题干挤掉（实测踩过）。
+        //    所以带题号/分值标记的行优先，标记行之间才比 y。
+        String markedStem = ""; int markedTop = -1;
         for (TextNode n : nodes) {
-            if (firstOptTop > 0 && n.top >= firstOptTop) continue;   // 选项区及以后
-            if (n.text.length() < 8) continue;                        // 太短（题号/分值/题型）
+            if (n.editable) continue;                                 // 输入框 hint 不是题干
+            if (firstOptTop > 0 && n.top >= firstOptTop) continue;    // 选项区及以后
             if (isChromeText(n.text)) continue;
+            if (isPlaceholder(n.text)) continue;                      // 「在此输入你的答案」类占位
+            boolean marked = STEM_MARK.matcher(n.text).find();
+            if (marked) {
+                if (markedStem.isEmpty() || n.top > markedTop) {
+                    markedStem = n.text; markedTop = n.top;
+                }
+                continue;
+            }
+            // 长度门槛：普通行要 ≥8 字（挡掉题号/分值/题型标签）
+            if (n.text.length() < 8) continue;
             // 取最靠下的一条较长文本作为题干（题干通常在选项紧上方）
             if (stem.isEmpty() || n.top > stemTop) { stem = n.text; stemTop = n.top; }
         }
+        if (!markedStem.isEmpty()) stem = markedStem;   // 带题号/分值的最可信
 
         if (stem.isEmpty() && options.isEmpty()) return "";
         try {
@@ -604,6 +857,25 @@ public class ReaderService extends AccessibilityService {
         } catch (Throwable t) {
             return "";
         }
+    }
+
+    /**
+     * 输入框占位提示（placeholder / hint），不是题干。
+     *
+     * mock 与学习通的答题框在 WebView 里渲染成普通 TextView（isEditable()=false），
+     * 所以不能只靠 editable 标志识别，必须按文案兜。
+     * 这些文字恰好都 ≥8 字，能骗过长度门槛，且位置在真题干下方，
+     * 「取最靠下的长文本」的规则会优先选中它们 —— 实测把简答题题干换成了
+     * 「在此输入你的答案」，模型只好回"请提供具体题目"。
+     */
+    private static boolean isPlaceholder(String s) {
+        if (s == null) return true;
+        String t = s.trim();
+        if (t.contains("在此输入") || t.contains("请输入")) return true;
+        if (t.contains("点击输入") || t.contains("输入你的答案")) return true;
+        if (t.contains("请输入答案") || t.contains("填写答案")) return true;
+        if (t.equals("答案") || t.equals("作答区")) return true;
+        return false;
     }
 
     /** UI 装饰文字（题型/工具栏/倒计时/按钮）——不作为题干 */
