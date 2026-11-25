@@ -17,7 +17,7 @@ import android.util.Log;
  * 这里用简单做法：action 带私钥字符串，只有知道该串的模块能发。
  *
  * which 取值：
- *   "overlay" → 切浮层显隐（Vol+ ×2）
+ *   "overlay" → 切浮层显隐（Vol- ×2）
  *   "app"     → 切总开关（Vol- ×3）
  *   "scan"    → 主动识别当前屏一次（Vol- 长按 2s），不改变任何开关状态
  */

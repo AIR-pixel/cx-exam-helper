@@ -126,7 +126,15 @@ powershell -ExecutionPolicy Bypass -File xposed\build-module.ps1
    - 总开关：停掉整条读题链路并隐藏浮层
    - **切换方式（已实现，真机验证）**：LSPosed 模块 `xposed/VolKeyModule.java` hook
      `system_server` 的 `PhoneWindowManager.interceptKeyBeforeQueueing`，双击音量键时
-     发广播给 `ToggleReceiver`。**双击 Vol+ = 浮层开关，双击 Vol- = 总开关**。
+     发广播给 `ToggleReceiver`。**手势全部集中在 Vol-，Vol+ 完全放行**：
+
+    | 手势 | 动作 |
+    |---|---|
+    | Vol- 双击 | 浮层显隐（读题/作答继续） |
+    | Vol- 三击 | 总开关（读题/浮层全停） |
+    | Vol- 按住 2s | 主动识别当前屏一次 |
+    | 单击（任一键） | 不拦截，正常调音量 |
+
      - 为什么不用 a11y `onKeyEvent`：实测 HyperOS 不向无障碍服务派发按键，`getevent`/
        `sendevent` 也抓不到（事件被 system_server 消费），只有 hook 按键分发层可靠。
      - 部署：模块的 LSPosed scope **必须包含 `system`**（不是 `android`），且改完要重启；

@@ -46,10 +46,7 @@ public class ReaderService extends AccessibilityService {
      * 30ms 内同 keyCode 视为同一次按键。
      */
     private static final long KEY_DEDUP_MS = 30;
-    private long lastVolUpDownAt = 0;
     private long lastVolDownDownAt = 0;
-    /** 冷却按 keyCode 分开：原来共享一个，导致 Vol+ 会吃掉紧接的 Vol- */
-    private long lastToggleUpAt = 0;
     private long lastToggleDownAt = 0;
     private int lastKeyCode = -1;
     private long lastKeyAt = 0;
@@ -225,7 +222,7 @@ public class ReaderService extends AccessibilityService {
         };
         Bus.setListener(busListener);
         if (ToggleStore.appOn() && ToggleStore.overlayOn()) overlay.show();
-        Bus.publishStatus("a11y 已连接 · Vol+×2 弹窗 / Vol-×2 总开关", "ready");
+        Bus.publishStatus("a11y 已连接 · Vol-×2 弹窗 / Vol-×3 总开关 / 长按识别", "ready");
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {
@@ -243,16 +240,17 @@ public class ReaderService extends AccessibilityService {
     }
 
     /**
-     * 音量键双击开关（替代 root daemon 方案：a11y 直接收按键，零额外进程）。
-     *   Vol+ 双击 → 切浮层显隐（读题/作答继续）
-     *   Vol- 双击 → 切总开关（读题/浮层全停）
+     * 音量键双击开关（a11y 兜底路径；HyperOS 上音量键被 system_server 消费，
+     * 实际生效的是 Xposed 模块 VolKeyModule，这里只在能收到键的 ROM 上兜底）。
+     *   Vol- 双击 → 切浮层显隐（读题/作答继续）
+     * Vol+ 不参与手势，完全放行。
      * 单击不拦截，正常调音量；双击窗口 500ms，触发后静默 600ms。
      */
     @Override public boolean onKeyEvent(android.view.KeyEvent e) {
         if (e == null) return false;
         int code = e.getKeyCode();
-        if (code != android.view.KeyEvent.KEYCODE_VOLUME_UP
-                && code != android.view.KeyEvent.KEYCODE_VOLUME_DOWN) return false;
+        // Vol+ 不接管：浮层显隐统一由 Vol- 双击负责
+        if (code != android.view.KeyEvent.KEYCODE_VOLUME_DOWN) return false;
         // 只认按下，忽略抬起/长按重复
         if (e.getAction() != android.view.KeyEvent.ACTION_DOWN || e.getRepeatCount() > 0) return false;
 
@@ -263,35 +261,20 @@ public class ReaderService extends AccessibilityService {
         lastKeyCode = code;
         lastKeyAt = now;
 
-        // ② 冷却按 keyCode 分开，避免 Vol+ 触发后把紧接着的 Vol- 吃掉
-        long lastFireThisKey = code == android.view.KeyEvent.KEYCODE_VOLUME_UP
-                ? lastToggleUpAt : lastToggleDownAt;
-        if (now - lastFireThisKey < TAP_COOLDOWN_MS) return false;
+        // ② 冷却
+        if (now - lastToggleDownAt < TAP_COOLDOWN_MS) return false;
 
-        long[] last = code == android.view.KeyEvent.KEYCODE_VOLUME_UP
-                ? new long[]{lastVolUpDownAt} : new long[]{lastVolDownDownAt};
-        boolean isDouble = now - last[0] <= DOUBLE_TAP_MS;
-        if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) lastVolUpDownAt = now;
-        else lastVolDownDownAt = now;
+        boolean isDouble = now - lastVolDownDownAt <= DOUBLE_TAP_MS;
+        lastVolDownDownAt = now;
         if (!isDouble) return false;
 
-        if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) lastToggleUpAt = now;
-        else lastToggleDownAt = now;
-        if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
-            boolean on = ToggleStore.toggleOverlay();
-            if (overlay != null) {
-                if (on && ToggleStore.appOn()) overlay.show(); else overlay.hide();
-            }
-            Bus.publishStatus("弹窗已" + (on ? "打开" : "关闭") + "（双击 Vol+ 切换）", "toggle");
-            Log.d(TAG, "KEY toggle overlay=" + on);
-        } else {
-            boolean on = ToggleStore.toggleApp();
-            if (overlay != null) {
-                if (on && ToggleStore.overlayOn()) overlay.show(); else overlay.hide();
-            }
-            Bus.publishStatus(on ? "应用已开启" : "应用已暂停（双击 Vol- 恢复）", "toggle");
-            Log.d(TAG, "KEY toggle app=" + on);
+        lastToggleDownAt = now;
+        boolean on = ToggleStore.toggleOverlay();
+        if (overlay != null) {
+            if (on && ToggleStore.appOn()) overlay.show(); else overlay.hide();
         }
+        Bus.publishStatus("弹窗已" + (on ? "打开" : "关闭") + "（双击 Vol- 切换）", "toggle");
+        Log.d(TAG, "KEY toggle overlay=" + on);
         // 返回 false：不吞键，音量照常变化（避免"按键坏了"的错觉）
         return false;
     }

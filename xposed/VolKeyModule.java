@@ -15,10 +15,11 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   getevent/sendevent 也抓不到 —— 事件被 PhoneWindowManager 在 system_server
  *   里消费。只有 hook 这里才能可靠拿到按键。
  *
- * 手势：
- *   Vol+ 双击 → 广播 com.air.mpprobe.TOGGLE {which=overlay}
- *   Vol- 双击 → 广播 ... {which=app}
- *   单击不拦截（正常调音量），双击窗口 500ms，触发后静默 600ms。
+ * 手势（全部集中在 Vol-，Vol+ 完全放行）：
+ *   Vol- 双击    → 广播 ... {which=overlay}  浮层显隐（读题/作答继续）
+ *   Vol- 三击    → 广播 ... {which=app}      总开关（读题/浮层全停）
+ *   Vol- 按住 2s → 广播 ... {which=scan}     主动识别当前屏一次
+ *   单击不拦截（正常调音量），短按窗口 500ms，触发后静默 600ms。
  *
  * 跨进程：system_server 发显式广播到 com.air.mpprobe，app 端 ToggleReceiver
  *   收到后改内存状态 + 回写 flag 文件（避免 system_server 直接写 app 私有目录
@@ -37,15 +38,11 @@ public class VolKeyModule implements IXposedHookLoadPackage {
     private static final long COOLDOWN_MS = 600;
     /** 短按派发窗口：最后一次松手后等这么久才判定单击/双击/三击 */
     private static final long TAP_WINDOW_MS = 500;
-    /** 双击窗口（Vol+ 专用，Vol- 用 TAP_WINDOW_MS 计数器） */
-    private static final long DOUBLE_MS = 500;
     /** 长按阈值：按住超过这个时长（且未松手）即触发主动识别 */
     private static final long LONG_PRESS_MS = 2000;
 
-    private static long lastUp = 0;
-    /** Vol- 触发冷却（与 Vol+ 的 lastFireUp 互不干扰） */
+    /** Vol- 触发冷却 */
     private static long lastFireDown = 0;
-    private static long lastFireUp = 0;
     /**
      * 同一次物理按键的标识：KeyEvent.getDownTime()。
      *
@@ -187,31 +184,11 @@ public class VolKeyModule implements IXposedHookLoadPackage {
             lastUpDownTime = downTime;
         }
 
+        // Vol+ 不参与任何手势，原样放行（正常调音量）。
+        // 浮层显隐统一由 Vol- 双击负责，两个键各管一件事，不会记混。
         if (code == KeyEvent.KEYCODE_VOLUME_DOWN) {
             onVolDown(e, action, downTime);
-        } else {
-            onVolUp(e, action);
         }
-    }
-
-    // ───────────────────────── Vol+ ─────────────────────────
-
-    private static void onVolUp(KeyEvent e, int action) {
-        if (action != KeyEvent.ACTION_DOWN) return;
-        try {
-            if (e.getRepeatCount() > 0) return;
-        } catch (Throwable ignored) {}
-
-        long now = System.currentTimeMillis();
-        if (now - lastFireUp < COOLDOWN_MS) return;
-
-        boolean isDouble = now - lastUp <= DOUBLE_MS;
-        lastUp = now;
-        if (!isDouble) return;
-
-        lastFireUp = now;
-        XposedBridge.log(TAG + " Vol+ x2 -> toggle overlay");
-        sendBroadcast("overlay");
     }
 
     // ───────────────────────── Vol- ─────────────────────────
@@ -220,7 +197,7 @@ public class VolKeyModule implements IXposedHookLoadPackage {
      * Vol- 手势：
      *   按住 ≥2s        → 主动识别当前页（which=scan）
      *   单击            → 不拦截，正常调音量
-     *   双击            → 退出弹窗（which=overlay）
+     *   双击            → 浮层显隐（which=overlay）
      *   三击            → 总开关（which=app）
      *
      * 为什么要等一个窗口才派发：
