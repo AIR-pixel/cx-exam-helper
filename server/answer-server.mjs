@@ -434,8 +434,14 @@ async function solve(text, preStructured, ocrText = '', force = false) {
     // 处理：把整屏文本当作一道题硬送模型，让模型自己判断这是什么。
     // 走的是同一条 缓存→模型→归一化 流水线，只是把闸门拆掉。
     const raw = String(text || '').trim();
-    if (force && raw.length >= 4) {
-      console.log(`[force] gate bypassed, send raw ${raw.length} chars to model`);
+    const ocr = String(ocrText || '').trim();
+    // 判据不能用 raw 单独看：纯图片页 / Canvas 自绘页的 a11y 文本是空的，
+    // 题干全在像素里（OCR 出来的 ocrText）。只看 raw 会让 force 在这类页面上
+    // 完全失效 —— 用户长按了，服务端却回 none，浮层显示「未识别到题目」。
+    // 所以 raw 和 ocr 任一够长就放行，stem 优先用 OCR（那才是题干）。
+    const forceBody = raw.length >= 4 ? raw : (ocr.length >= 4 ? ocr : '');
+    if (force && forceBody) {
+      console.log(`[force] gate bypassed, raw=${raw.length} ocr=${ocr.length} chars`);
       const opts = (preStructured?.options || []).map((s, i) => {
         const str = String(s || '').trim();
         const m = str.match(/^([A-J])\s*[.、．)）:：]\s*(.*)$/);
@@ -448,11 +454,11 @@ async function solve(text, preStructured, ocrText = '', force = false) {
         examPage: true,
         forced: true,
         primary: {
-          stem: structStem || raw,
+          stem: structStem || (ocr.length >= 4 ? ocr : raw),
           options: opts,
           type: 'unknown',
           typeLabel: preStructured?.typeLabel || '',
-          blanks: countBlanks(raw),
+          blanks: countBlanks(forceBody),
         },
         screenHash: structured.screenHash || '',
         stableKey: '',
@@ -464,6 +470,19 @@ async function solve(text, preStructured, ocrText = '', force = false) {
     // 非题目页（登录页/首页/课程列表/消息页）：不调模型、不入缓存、不糊叠层。
     // 手机端收到 source=none 会显示"未识别到题目"并保持上一题答案不变。
     const r = structured.rejected;
+    // force 却什么都没拿到 —— 用户明确长按了，得说清原因，不能让浮层停在
+    // 「正在识别当前页面…」。典型场景：纯图片页 + OCR 服务没配/挂了。
+    if (force) {
+      console.log(`[none] force requested but nothing usable`
+        + ` raw=${String(text || '').trim().length}`
+        + ` ocr=${String(ocrText || '').trim().length}`);
+      return {
+        answer: ocrText ? '这一屏没读到题干，换一题试试' : '这一屏没有文字，图片题需要 OCR 服务（未配置）',
+        source: 'none',
+        question: null,
+        structured,
+      };
+    }
     console.log(`[none] not a question page examPage=${structured.examPage}`
       + (r ? ` candidate="${String(r.stem || '').slice(0, 40)}"` : ' (empty after clean)'));
     return {

@@ -9,7 +9,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="SKIP_SCREENSHOT + 音量键手势：Vol+×2=弹窗显隐，Vol-×2=退出弹窗，Vol-×3=总开关，Vol-长按2s=主动识别当前屏" />
+            android:value="SKIP_SCREENSHOT + 音量键手势（全部集中在 Vol-）：双击=弹窗显隐，三击=总开关，长按2s=主动识别当前屏。Vol+ 不参与任何手势。" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />

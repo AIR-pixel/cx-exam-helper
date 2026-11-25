@@ -108,6 +108,17 @@ public class ReaderService extends AccessibilityService {
     private String lastOcrA11yText = "";
     /** 上一次成功作答的图片 URL；用于发送前拦截同一张图的重复请求 */
     private String lastImageUrl = "";
+    /**
+     * lastImageUrl 的作答时刻。
+     *
+     * 原来判据是 url 相同 + lastScreenHash 非空，但 lastScreenHash 由
+     * handleText / handleWithOcr 也会写，来源不同 —— 文本题答过之后
+     * lastScreenHash 非空，切到图片题时即使 URL 是新的也可能被误挡。
+     * 改成只认自己的时间戳，10 秒内的同 URL 才算重复。
+     */
+    private long lastImageUrlAt = 0;
+    /** 同一张图多少毫秒内允许跳过（超过就允许重试，防误锁） */
+    private static final long IMAGE_URL_TTL_MS = 10000;
 
     private AnswerOverlay overlay;
     /** 静态引用，供 Main 配置页在 onResume 时直接撤掉叠层 */
@@ -154,6 +165,17 @@ public class ReaderService extends AccessibilityService {
         scanGen++;
         if (pending != null) { h.removeCallbacks(pending); pending = null; }
         attempt(0);
+
+        // 兜底：attempt(0) 里若因 inFlight 被别的线程抢先而走 deferredScan 分支，
+        // forceNext 会留在 true 但没有任何请求在跑，浮层就永久停在
+        // 「正在识别当前页面…」。1.5s 后检查一次，还在就补扫。
+        final int gen = scanGen;
+        h.postDelayed(new Runnable() { public void run() {
+            if (gen != scanGen) return;          // 期间又有新的扫描，交给它
+            if (!forceNext) return;              // 已被消费，正常路径
+            Log.d(TAG, "force scan not consumed, retry");
+            attempt(0);
+        } }, 1500);
     }
 
     /** 下一次上送是否强制（跳过服务端闸门）。用完即清。 */
@@ -218,6 +240,9 @@ public class ReaderService extends AccessibilityService {
                     else overlay.hide();
                 }
                 if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.status(text, kind);
+                // status 走的是 overlay.status()，不打 OVERLAY[ 那条日志，
+                // 排查「浮层到底显示了什么」时需要单独一条。
+                Log.i(TAG, "STATUS[" + kind + "] " + text);
             }
         };
         Bus.setListener(busListener);
@@ -447,7 +472,7 @@ public class ReaderService extends AccessibilityService {
             }
             // 文字太少（纯图片页 / Canvas 自绘）：只能截屏 OCR
             Log.d(TAG, "FORCE scan: too little text, go OCR");
-            handleWithOcr(text, false);
+            handleWithOcr(text, true);
             return;
         }
 
@@ -725,8 +750,20 @@ public class ReaderService extends AccessibilityService {
         // 发送前就去重：同一张图（URL 相同）已经答过就别再发请求。
         // 不这么做的话，轮询每 2.5s 一跳都会把同一张图重发一遍，
         // 只有等服务端返回后才发现 stableKey 重复——实测 10 秒发了 5 次。
-        if (url.equals(lastImageUrl) && !lastScreenHash.isEmpty()) {
-            Log.d(TAG, "image url skip: same url, already answered");
+        //
+        // force（用户长按主动识别）必须跳过这道去重：
+        //   长按第二次时 URL 没变、lastScreenHash 非空 → 直接 return，
+        //   浮层会永久停在「正在识别当前页面…」，看起来像卡死。
+        //   用户已经明确要求「再读一次这一屏」，重复请求是他要的。
+        //
+        // 判据只用自己的 lastImageUrlAt，不借用 lastScreenHash ——
+        // lastScreenHash 会被 handleText / handleWithOcr 写，来源不同，
+        // 借它判断会让「文本题答完 → 切图片题」误挡。
+        // 加 IMAGE_URL_TTL_MS 上限：超过 10 秒允许重试，避免真的误锁。
+        if (!force && url.equals(lastImageUrl)
+                && System.currentTimeMillis() - lastImageUrlAt < IMAGE_URL_TTL_MS) {
+            Log.d(TAG, "image url skip: same url, answered "
+                    + (System.currentTimeMillis() - lastImageUrlAt) + "ms ago");
             if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.show();
             return;
         }
@@ -741,16 +778,22 @@ public class ReaderService extends AccessibilityService {
                 if (a == null) return;
                 if ("none".equals(a.source)) {
                     Log.d(TAG, "image url: server says not a question, drop");
-                    Bus.publishStatus("未识别到题目", "off");
+                    // 用服务端给的文案：force 时会说明具体原因
+                    //（「这一屏没有文字，图片题需要 OCR 服务」等），
+                    // 固定写"未识别到题目"会把有用信息吞掉。
+                    Bus.publishStatus(a.text == null || a.text.isEmpty()
+                            ? "未识别到题目" : a.text, "off");
                     return;
                 }
                 String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
-                if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
+                // force 时同样跳过：用户主动要的这一次，答案再一样也要重新画上去
+                if (!force && !dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
                     Log.d(TAG, "image url skip same question " + dedupKey);
                     return;
                 }
                 lastScreenHash = dedupKey;
                 lastImageUrl = url;
+                lastImageUrlAt = System.currentTimeMillis();
                 Log.d(TAG, "image-url answer src=" + a.source + " type=" + a.type + " => " + a.text);
                 Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
             } finally {
@@ -767,7 +810,10 @@ public class ReaderService extends AccessibilityService {
         // 而且 hide/show 是 UI 线程异步的，交错执行会让叠层停在隐藏状态
         // （实测 OVERLAY[not-attached]）。图片题的选项本身在 a11y 里可读，
         // 所以「a11y 文本没变 + 已经答过」就足以判定是同一题，直接跳过。
-        if (a11yText != null && a11yText.equals(lastOcrA11yText) && !lastScreenHash.isEmpty()) {
+        //
+        // force（长按主动识别）跳过：用户明确要求再读一次这一屏。
+        // 不跳过的话，长按第二次会静默 return，浮层永久停在「正在识别当前页面…」。
+        if (!force && a11yText != null && a11yText.equals(lastOcrA11yText) && !lastScreenHash.isEmpty()) {
             Log.d(TAG, "OCR skip: same a11y text, already answered");
             // 跳过 OCR 不等于什么都不做：上一轮 hide 掉的叠层必须重新挂上，
             // 否则会一直停在隐藏状态（实测 OVERLAY[not-attached]）。
@@ -832,11 +878,12 @@ public class ReaderService extends AccessibilityService {
                 // 服务端二次判定为非题目（图片里其实也不是题）：不糊叠层
                 if ("none".equals(a.source)) {
                     Log.d(TAG, "OCR fallback: server says not a question, drop");
-                    Bus.publishStatus("未识别到题目", "off");
+                    Bus.publishStatus(a.text == null || a.text.isEmpty()
+                            ? "未识别到题目" : a.text, "off");
                     return;
                 }
                 String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
-                if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
+                if (!force && !dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
                     Log.d(TAG, "OCR fallback skip same question " + dedupKey);
                     return;
                 }
@@ -891,13 +938,16 @@ public class ReaderService extends AccessibilityService {
                 // 服务端判定为非题目（题干清洗后只剩页面装饰）：不糊叠层、不占去重位
                 if ("none".equals(a.source)) {
                     Log.d(TAG, "server says not a question, drop (kept last=" + lastScreenHash + ")");
-                    Bus.publishStatus("未识别到题目", "off");
+                    Bus.publishStatus(a.text == null || a.text.isEmpty()
+                            ? "未识别到题目" : a.text, "off");
                     return;
                 }
                 // 去重键优先用 stableKey（题干+选项哈希，滚动不变），
                 // 没有时才退回整屏 screenHash（老版 PC 服务兼容）。
                 String dedupKey = a.stableKey.isEmpty() ? a.screenHash : a.stableKey;
-                if (!dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
+                // force 时跳过：长按第二次答案相同也要重新画上去，
+                // 否则静默 return，浮层停在「正在识别当前页面…」看起来像卡死。
+                if (!force && !dedupKey.isEmpty() && dedupKey.equals(lastScreenHash)) {
                     Log.d(TAG, "skip same question " + dedupKey);
                     return;
                 }
