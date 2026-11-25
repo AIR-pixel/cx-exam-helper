@@ -425,6 +425,75 @@ eq('超长文本不炸', (() => { try { parseScreen('长'.repeat(50000)); return
   ok('几何：单选项不恢复', !/^B[.、]/.test(oneText), oneText);
 }
 
+// ══════════════ 13. OCR 裸标签（第 7 题）══════════════
+// 真机数据（同一台机器，河南普法竞赛第 7 题，打赏退款）。
+// 这一题暴露的是「固定面积」缺陷：A 和 D 的选项字母被 OCR 单独切成小块，
+// 块里只有 "A." / "D." 没有正文 → matchOption 判为无标签 →
+// 已标注行只剩 B、C → 选项区边界只框住 B/C → A(871) 和 D(1452) 全被跳过。
+// 纯文本层面同样是 2 个选项，与第 5 题表现一致但成因不同。
+{
+  const boxes = [
+    { x: 92,  y: 361,  x2: 200, y2: 395,  text: '答题进度' },
+    { x: 117, y: 551,  x2: 220, y2: 588,  text: '单选题' },
+    { x: 265, y: 549,  x2: 600, y2: 590,  text: '17岁的小尚长期以自己的劳动' },
+    { x: 93,  y: 611,  x2: 620, y2: 652,  text: '为主要生活来源，在网络平台进行大' },
+    { x: 96,  y: 674,  x2: 630, y2: 713,  text: '赏。其父母主张打赏行为仅因其未成年' },
+    { x: 95,  y: 736,  x2: 600, y2: 776,  text: '然无效。下列说法正确的是' },
+    // A：裸标签在两行正文之间（y=901 落在 871 和 923 之间）
+    { x: 180, y: 871,  x2: 660, y2: 907,  text: '未满18周岁，实施的所有民事法律行为均效力' },
+    { x: 125, y: 901,  x2: 165, y2: 937,  text: 'A.' },
+    { x: 174, y: 923,  x2: 250, y2: 970,  text: '待定' },
+    // B：标签夹在自己正文的第二行里，正文第一行在标签行上方
+    { x: 179, y: 1065, x2: 660, y2: 1100, text: '该学生依法视为完全民事行为能力人，打赏效力' },
+    { x: 127, y: 1124, x2: 660, y2: 1157, text: 'B.不能仅根据年龄认定，但仍需审查是否存' },
+    { x: 180, y: 1180, x2: 480, y2: 1213, text: '在其它影响效力的因素' },
+    { x: 129, y: 1318, x2: 620, y2: 1348, text: 'C．平台在任何情况下均须全额退款' },
+    // D：同样是裸标签
+    { x: 183, y: 1452, x2: 660, y2: 1485, text: '小尚成年后，此前实施的所有民事法律行为自' },
+    { x: 125, y: 1482, x2: 165, y2: 1516, text: 'D.' },
+    { x: 178, y: 1507, x2: 280, y2: 1545, text: '动失效' },
+    { x: 241, y: 1759, x2: 340, y2: 1808, text: '上一题' },
+    { x: 704, y: 1762, x2: 800, y2: 1804, text: '下一题' },
+  ];
+  const rawText = boxes.map((b) => b.text).join('\n');
+
+  // 恢复前：纯文本层面整题解析不出来（裸标签孤立成行 + B 的标签混在正文里，
+  // 选项块根本不连续）。这正是线上「只读到 2 个选项」的成因之一。
+  const before = parseScreen(rawText).primary;
+  ok('裸标签：不带坐标解析失败或选项不全',
+    !before || before.options.length < 4,
+    before ? `${before.options.length} 选项` : 'null');
+
+  // 恢复后：4 个选项全齐
+  const r = parseScreen(rawText, { boxes });
+  eq('裸标签：带坐标恢复 4 选项', r.primary.options.length, 4);
+  eq('裸标签：A 被补回', r.primary.options[0].key, 'A');
+  eq('裸标签：D 被补回', r.primary.options[3].key, 'D');
+  eq('裸标签：题型仍为单选', r.primary.type, 'single');
+
+  // A 的两行正文（871 / 923）都归到 A，且裸标签本身不残留
+  ok('裸标签：A 正文完整', r.primary.options[0].text.includes('未满18周岁')
+    && r.primary.options[0].text.includes('待定'), r.primary.options[0].text);
+  const texts = rebuildTextWithGeometry(rawText, boxes).split('\n');
+  ok('裸标签：不残留孤立标签行',
+    !texts.some((t) => /^[A-H][.、．]$/.test(t.trim())),
+    texts.filter((t) => /^[A-H][.、．]$/.test(t.trim())).join('|'));
+
+  // B 的正文第一行在标签上方，必须向上归并，不能孤立留在 A 和 B 之间
+  ok('裸标签：B 上方正文已归并',
+    r.primary.options[1].text.includes('该学生依法视为'), r.primary.options[1].text);
+
+  // 防误补：B 的正文第一行（y=1065）缩进够、行距也像选项，
+  // 但 B 在 1124 已有标签，不能再造一个 B
+  const keys = r.primary.options.map((o) => o.key);
+  eq('裸标签：字母不重复', new Set(keys).size, keys.length);
+  ok('裸标签：无重复 B', keys.filter((k) => k === 'B').length === 1, keys.join(','));
+
+  // 按钮仍不能被误标
+  ok('裸标签：按钮不被误标', !texts.some((t) => /^[EF][.、]/.test(t)),
+    texts.filter((t) => t.includes('上一题')).join('|'));
+}
+
 // ══════════════ 报告 ══════════════
 console.log(`\n${'='.repeat(60)}`);
 if (fail === 0) {

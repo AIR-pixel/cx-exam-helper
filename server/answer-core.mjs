@@ -429,9 +429,57 @@ export function countBlanks(stem) {
 export function recoverOptionsByGeometry(boxes) {
   if (!Array.isArray(boxes) || boxes.length < 3) return boxes || [];
 
+  let out = boxes.map((b) => ({ ...b }));
+
+  // ══════════ 第一遍：裸标签贴回正文行 ══════════
+  //
+  // OCR 有时把选项字母单独切成一个小块，块里只有 "A." / "D."，没有任何正文。
+  // matchOption 要求分隔符后面有文字，于是这些行被判为「无标签」，
+  // 选项数直接从 4 掉到 2（真机第 7 题：A 和 D 都是这种裸标签）。
+  //
+  // 裸标签的纵向位置很刁钻：它在两行正文**之间**（A. 在 y=901，
+  // 正文在 871 和 923），因为 OCR 框按字形居中。所以「最近的上方正文行」
+  // 才是它的归属，不能取纵向距离最近的那行（923 只差 22px，会抢走标签）。
+  const BARE_LABEL_RE = /^(?:[（(]([A-H])[)）]|([A-H])[.、．)）:：])$/;
+  const isBare = (t) => BARE_LABEL_RE.test(String(t || '').trim());
+
+  const orphans = [];
+  for (let i = 0; i < out.length; i++) {
+    const m = BARE_LABEL_RE.exec(String(out[i].text || '').trim());
+    if (m) orphans.push({ i, key: (m[1] || m[2]).toUpperCase(), box: out[i] });
+  }
+
+  const dropped = new Set();
+  for (const o of orphans) {
+    const pick = (above) => {
+      let best = -1, bestD = Infinity;
+      for (let j = 0; j < out.length; j++) {
+        if (j === o.i || dropped.has(j)) continue;
+        const c = out[j];
+        const t = String(c.text || '').trim();
+        if (!t || matchOption(t) || isBare(t)) continue;
+        // 正文必须比标签右移：标签在选项栏，正文缩进进去（实测 55~58px）
+        if (c.x - o.box.x < 24) continue;
+        const d = above ? o.box.y - c.y : c.y - o.box.y;
+        // 一个行高以内才算「同一行组」；超过就是在别的选项里了
+        if (d > 0 && d <= 90 && d < bestD) { best = j; bestD = d; }
+      }
+      return best;
+    };
+    // 先找上方，找不到再找下方（少数版式标签与首行同基线）
+    let idx = pick(true);
+    if (idx < 0) idx = pick(false);
+    if (idx >= 0) {
+      out[idx].text = `${o.key}. ${String(out[idx].text).trim()}`;
+      out[idx].recovered = true;
+      dropped.add(o.i);
+    }
+  }
+  if (dropped.size) out = out.filter((_, i) => !dropped.has(i));
+
   // 只处理「有选项标签」的行：先算出正常选项的正文左边界基准
-  const labeled = boxes.filter((b) => matchOption(b.text));
-  if (labeled.length < 2) return boxes;
+  const labeled = out.filter((b) => matchOption(b.text));
+  if (labeled.length < 2) return out;
 
   // 基准左边界只能从「带标签的选项行」算 —— 不能从全屏最小值算。
   // 题干行通常贴着左边界（实测 x=95/96），比选项正文（x=126）更靠左，
@@ -449,7 +497,7 @@ export function recoverOptionsByGeometry(boxes) {
     const d = labeled[i].y - labeled[i - 1].y;
     if (d > 0) gaps.push(d);
   }
-  if (gaps.length === 0) return boxes;
+  if (gaps.length === 0) return out;
   const optionGap = Math.min(...gaps);
 
   // 缩进阈值：正文右移超过 baseX 的 8%（实测 184-126=58，126*0.08≈10，
@@ -458,20 +506,30 @@ export function recoverOptionsByGeometry(boxes) {
   // 行距容差：选项间距 ±25%（实测 optionGap=139，容差 35）
   const gapTol = optionGap * 0.25;
 
-  // 选项区的 y 范围：第一个到最后一个已标注选项之间。
-  // 越界的一律不碰 —— 「上一题/下一题」按钮正好落在 D 下方一个行距处，
-  // 缩进也够（x=241），不设边界会被误标成 E（实测踩到）。
-  const yMin = Math.min(...labeled.map((b) => b.y));
-  const yMax = Math.max(...labeled.map((b) => b.y));
+  // 选项区的 y 范围：第一个到最后一个已标注选项，**各向外扩一个完整行距**。
+  //
+  // 这里踩过一次「固定面积」的坑：原来只外扩半个行距，而边界是从已标注行
+  // 算的 —— 第 7 题只有 B、C 认得出标签，边界就成了 [1055, 1387]，
+  // A(871) 和 D(1452) 全在框外被跳过，选项数还是 2。
+  // 外扩一个完整行距后，最外侧那个漏标签的选项也能进来；
+  // 「上一题/下一题」按钮离最后一个选项约两个行距，仍被挡在外面。
+  const yMin = Math.min(...labeled.map((b) => b.y)) - optionGap;
+  const yMax = Math.max(...labeled.map((b) => b.y)) + optionGap;
 
-  const out = boxes.map((b) => ({ ...b }));
+  // 已被占用的字母：推断新标签时不能撞车。
+  // 第 7 题 B 的正文第一行（y=1065）没有标签、缩进也够、行距也像选项，
+  // 会被误判成"漏了 B"—— 但 B 明明在 1124 已经有标签了。
+  // 不查重就会造出两个 B，选项数虚高到 5。
+  const usedKeys = new Set(labeled.map((b) => matchOption(b.text).key));
+
   // 逐个检查「无标签且缩进」的行，判断它是不是漏了标签的新选项
   for (let i = 0; i < out.length; i++) {
     const cur = out[i];
     if (matchOption(cur.text)) continue;          // 已有标签，跳过
+    if (isBare(cur.text)) continue;               // 裸标签，第一遍已处理
     if (cur.x - baseX < indentThreshold) continue; // 没缩进 → 是折行
-    // 必须落在选项区内（含首尾各半个行距的余量）
-    if (cur.y < yMin - optionGap / 2 || cur.y > yMax + optionGap / 2) continue;
+    // 必须落在选项区内（含首尾各一个行距的余量）
+    if (cur.y < yMin || cur.y > yMax) continue;
 
     // 找它上方最近的「选项正文起点」（有标签的行，或已补标签的行）
     let prev = null;
@@ -488,28 +546,37 @@ export function recoverOptionsByGeometry(boxes) {
     const prevKey = matchOption(prev.text).key;
     const nextKey = String.fromCharCode(prevKey.charCodeAt(0) + 1);
     if (nextKey > 'H') continue;
+    if (usedKeys.has(nextKey)) continue;          // 该字母已存在，不是漏标签
 
     cur.text = `${nextKey}. ${cur.text}`;
     cur.recovered = true;
+    usedKeys.add(nextKey);
   }
 
-  // 第二遍：合并折行。
+  // ══════════ 第三遍：折行归并（可上可下） ══════════
   //
-  // 为什么必须做：选项正文折成两行时，第二行不带标签，会夹在「当前选项」
-  // 和「下一个选项」之间，把 splitQuestions 的「连续选项块」切断 ——
-  // 实测 C 补上标签后，C 的第二行「也有过错的…」把块切在 C 处，
-  // D 变成独立单行块，被 >=2 规则丢掉，选项数还是不全。
+  // 为什么必须做：选项正文折行时，那些行不带标签，会夹在两个选项之间，
+  // 把 splitQuestions 的「连续选项块」切断 —— 实测 C 补上标签后，
+  // C 的第二行「也有过错的…」把块切在 C 处，D 变成独立单行块被丢弃。
   //
-  // 判据：无标签 + 行距明显小于一个选项间距（折行紧贴上一行）。
+  // 折行可能在标签行**上方**也可能在下方，取决于 OCR 把标签放在第几行：
+  // 第 7 题的 B 就是「正文1(y=1065) / 标签+正文2(y=1124) / 正文3(y=1180)」，
+  // 只往下归并的话，正文1 会孤零零留在 A 和 B 之间，照样切断选项块。
+  //
+  // 判据：无标签 + 到相邻标签行的距离明显小于一个选项间距（折行紧贴）。
   // 拼接而不是丢弃：折行是选项正文的一部分，丢了会让模型看到半句话。
   const merged = [];
-  for (const b of out) {
+  for (let i = 0; i < out.length; i++) {
+    const b = out[i];
+    if (matchOption(b.text)) { merged.push({ ...b }); continue; }
+
     const prev = merged[merged.length - 1];
+    const prevLbl = prev ? matchOption(prev.text) : null;
     // 折行只能拼到「带标签的行」上：题干、按钮、装饰行都不是选项正文，
     // 把折行拼到它们后面会毁掉题干结构（实测题干两行被拼成一行）。
-    if (prev && matchOption(prev.text) && !matchOption(b.text)) {
+    if (prevLbl) {
       const gap = b.y - prev.y;
-      // 折行间距约为行高（实测 57），选项间距约 139；取 60% 作分界
+      // 折行间距约为行高（实测 52~59），选项间距约 139~164；取 60% 作分界
       if (gap > 0 && gap < optionGap * 0.6) {
         // 必须拼成**同一行**（不带换行符）。
         // 用 \n 拼接等于没合并：下游 cleanLines 按行切分，折行依旧是独立
@@ -519,6 +586,24 @@ export function recoverOptionsByGeometry(boxes) {
         continue;
       }
     }
+
+    // 往下找不到位置，试向上归并：找下方最近的标签行
+    let next = null;
+    for (let k = i + 1; k < out.length; k++) {
+      if (matchOption(out[k].text)) { next = out[k]; break; }
+    }
+    if (next) {
+      const gap = next.y - b.y;
+      if (gap > 0 && gap < optionGap * 0.6) {
+        const nl = matchOption(next.text);
+        // 标签被 OCR 夹在正文中间时，把它剥掉再统一放回行首，
+        // 否则会得到「该学生…打赏B.力不能…」这种半句话带字母的怪文本。
+        const body = String(next.text).replace(/^[（(]?[A-H][)）]?\s*[.、．)）:：]?\s*/, '');
+        next.text = `${nl.key}. ${b.text}${body}`;
+        continue;
+      }
+    }
+
     merged.push({ ...b });
   }
   return merged;
