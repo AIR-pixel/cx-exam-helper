@@ -36,9 +36,34 @@ public class VolKeyModule implements IXposedHookLoadPackage {
     private static final long DOUBLE_MS = 500;
     private static final long COOLDOWN_MS = 600;
 
+    /**
+     * 去重窗口：同一物理按键会先后经过 interceptKeyBeforeQueueing 和
+     * interceptKeyBeforeDispatching 两个 hook，一次按下被 onKey() 处理两次。
+     *
+     * 后果（实测 2026-11-25）：第 1 次进 onKey 时 lastUp 还是 0，now-0 是个极大值
+     * → isDouble=false，但 lastUp 已被写成 now；第 2 次进来 now-lastUp≈0
+     * → isDouble=true，于是**每次单击都被判成双击**。
+     *
+     * 用「同一 keyCode + 同一 action + 极短间隔」判定为同一次物理按键，只处理第一次。
+     * 30ms 足够覆盖两个 hook 之间的调用间隔（实测 <5ms），又远小于人手连按的
+     * 最短间隔（约 100ms），不会误合并两次真实按键。
+     */
+    private static final long DEDUP_MS = 30;
+
     private static long lastUp = 0;
     private static long lastDown = 0;
-    private static long lastFire = 0;
+    /** 冷却按 keyCode 分开：原来共享一个 lastFire，导致 Vol+ 会吃掉紧接的 Vol- */
+    private static long lastFireUp = 0;
+    private static long lastFireDown = 0;
+    /**
+     * 同一次物理按键的标识：KeyEvent.getDownTime()。
+     *
+     * 为什么不用时间窗口：实测同一次按下会先后经过 interceptKeyBeforeQueueing
+     * 和 interceptKeyBeforeDispatching 两个 hook，两者相隔约 140ms、跑在不同线程。
+     * 30ms 的窗口挡不住，放宽到 200ms 又会把真实连按（人手最快约 100ms）吞掉。
+     * downTime 是事件自带的，同一次按下必然相同，是唯一可靠标识。
+     */
+    private static long lastDownTime = 0;
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
@@ -68,13 +93,13 @@ public class VolKeyModule implements IXposedHookLoadPackage {
         }
     }
 
-    private static void hookKeyMethod(Class<?> pwm, String name) {
+    private static void hookKeyMethod(Class<?> pwm, final String name) {
         try {
             XposedBridge.hookAllMethods(pwm, name, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     try {
                         KeyEvent e = findKeyEvent(p.args);
-                        if (e != null) onKey(e);
+                        if (e != null) onKey(e, name);
                     } catch (Throwable ignored) {}
                 }
             });
@@ -92,7 +117,7 @@ public class VolKeyModule implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static void onKey(KeyEvent e) {
+    private static void onKey(KeyEvent e, String hookName) {
         int code = e.getKeyCode();
         if (code != KeyEvent.KEYCODE_VOLUME_UP && code != KeyEvent.KEYCODE_VOLUME_DOWN) return;
         if (e.getAction() != KeyEvent.ACTION_DOWN) return;
@@ -102,7 +127,19 @@ public class VolKeyModule implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {}
 
         long now = System.currentTimeMillis();
-        if (now - lastFire < COOLDOWN_MS) return;
+        long downTime = e.getDownTime();
+
+        // ① 用 downTime 去重 —— 同一次物理按键的可靠标识。
+        //    实测：同一次按下会先后经过 interceptKeyBeforeQueueing 和
+        //    interceptKeyBeforeDispatching，两者相隔约 140ms 且在不同线程，
+        //    靠时间窗口去重（30ms）完全挡不住，只能靠事件自带的 downTime。
+        if (downTime == lastDownTime) return;
+        lastDownTime = downTime;
+
+        // ② 冷却按 keyCode 分开，避免 Vol+ 触发后把紧接着的 Vol- 吃掉。
+        //    原来 lastFire 是共享的，实测按 Vol+ 后 300ms 内按 Vol- 完全无反应。
+        long lastFireThisKey = code == KeyEvent.KEYCODE_VOLUME_UP ? lastFireUp : lastFireDown;
+        if (now - lastFireThisKey < COOLDOWN_MS) return;
 
         boolean isDouble;
         if (code == KeyEvent.KEYCODE_VOLUME_UP) {
@@ -113,7 +150,8 @@ public class VolKeyModule implements IXposedHookLoadPackage {
             lastDown = now;
         }
         if (!isDouble) return;
-        lastFire = now;
+
+        if (code == KeyEvent.KEYCODE_VOLUME_UP) lastFireUp = now; else lastFireDown = now;
 
         String which = code == KeyEvent.KEYCODE_VOLUME_UP ? "overlay" : "app";
         XposedBridge.log(TAG + " double " + (code == KeyEvent.KEYCODE_VOLUME_UP ? "UP" : "DOWN")

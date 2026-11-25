@@ -39,9 +39,20 @@ public class ReaderService extends AccessibilityService {
     // 音量键双击开关
     private static final long DOUBLE_TAP_MS = 500;   // 两次短按间隔上限
     private static final long TAP_COOLDOWN_MS = 600; // 触发后静默，防连发
+    /**
+     * 同一物理按键去重窗口。
+     * onKeyEvent 可能对一次按下收到多条事件（部分 ROM 的重复派发），
+     * 且 Xposed 路径与 a11y 路径并存时也可能双触发。
+     * 30ms 内同 keyCode 视为同一次按键。
+     */
+    private static final long KEY_DEDUP_MS = 30;
     private long lastVolUpDownAt = 0;
     private long lastVolDownDownAt = 0;
-    private long lastToggleAt = 0;
+    /** 冷却按 keyCode 分开：原来共享一个，导致 Vol+ 会吃掉紧接的 Vol- */
+    private long lastToggleUpAt = 0;
+    private long lastToggleDownAt = 0;
+    private int lastKeyCode = -1;
+    private long lastKeyAt = 0;
 
     /**
      * 答题页专属界面元素。只出现在考试/作业答题页，
@@ -176,7 +187,16 @@ public class ReaderService extends AccessibilityService {
         if (e.getAction() != android.view.KeyEvent.ACTION_DOWN || e.getRepeatCount() > 0) return false;
 
         long now = System.currentTimeMillis();
-        if (now - lastToggleAt < TAP_COOLDOWN_MS) return false;
+
+        // ① 同一物理按键去重（部分 ROM 对一次按下派发多条事件）
+        if (code == lastKeyCode && now - lastKeyAt < KEY_DEDUP_MS) return false;
+        lastKeyCode = code;
+        lastKeyAt = now;
+
+        // ② 冷却按 keyCode 分开，避免 Vol+ 触发后把紧接着的 Vol- 吃掉
+        long lastFireThisKey = code == android.view.KeyEvent.KEYCODE_VOLUME_UP
+                ? lastToggleUpAt : lastToggleDownAt;
+        if (now - lastFireThisKey < TAP_COOLDOWN_MS) return false;
 
         long[] last = code == android.view.KeyEvent.KEYCODE_VOLUME_UP
                 ? new long[]{lastVolUpDownAt} : new long[]{lastVolDownDownAt};
@@ -185,7 +205,8 @@ public class ReaderService extends AccessibilityService {
         else lastVolDownDownAt = now;
         if (!isDouble) return false;
 
-        lastToggleAt = now;
+        if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) lastToggleUpAt = now;
+        else lastToggleDownAt = now;
         if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
             boolean on = ToggleStore.toggleOverlay();
             if (overlay != null) {
