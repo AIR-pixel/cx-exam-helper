@@ -128,8 +128,15 @@
         <select id="cfgRegion"><option value="cn">cn（国内）</option><option value="global">global</option></select>
       </div>
       <div class="row"><label>模型 key</label><input id="cfgQModel" placeholder="dfmodel"></div>
+      <div class="row"><label>视觉模型</label><input id="cfgVlModel" placeholder="留空=同上；dfmodel/gmodel_latest/mmodel 可看图"></div>
       <div class="row"><label>PAT</label><input id="cfgQPat" type="password" placeholder="留空则用本地 ~/.dsh 凭据"></div>
       <p class="hint" id="patHint">留空自动读取 ~/.dsh/.qoder-accounts.cn.json；填写则覆盖。</p>
+    </div>
+    <div class="sep"></div>
+    <div id="visionBox">
+      <h2 style="margin-top:0">图片题视觉兜底</h2>
+      <div class="row"><label>启用</label><input id="cfgVision" type="checkbox"><span class="hint" style="margin:0">OCR 读不出题干时把原图交给视觉模型（几何图/结构式才走，纯文字题不烧图片额度）</span></div>
+      <div class="row"><label>汉字阈值</label><input id="cfgMinHan" type="number" min="0" max="100"><span class="hint" style="margin:0">OCR 有效汉字低于此数判为「读不出题干」，默认 8</span></div>
     </div>
     <div class="sep"></div>
     <div id="apiBox">
@@ -176,6 +183,9 @@ function renderCfg(c){
   $('cfgLong').checked = !!c.longTest;
   $('cfgRegion').value = c.qoderRegion || 'cn';
   $('cfgQModel').value = c.qoderModel || 'dfmodel';
+  $('cfgVlModel').value = c.vlModel || '';
+  $('cfgVision').checked = c.vision !== false;
+  $('cfgMinHan').value = c.visionMinHan != null ? c.visionMinHan : 8;
   $('cfgQPat').value = '';
   $('cfgQPat').placeholder = c._hasQoderPat ? '••••••••（已设置，留空保持不变）' : '留空则用本地 ~/.dsh 凭据';
   $('cfgBase').value = c.openaiBase || '';
@@ -239,6 +249,9 @@ function collect(){
     longTest: $('cfgLong').checked,
     qoderRegion: $('cfgRegion').value,
     qoderModel: $('cfgQModel').value.trim() || 'dfmodel',
+    vlModel: $('cfgVlModel').value.trim(),
+    vision: $('cfgVision').checked,
+    visionMinHan: Number($('cfgMinHan').value) || 0,
     ...(qPat ? { qoderPat: qPat } : {}),
     openaiBase: $('cfgBase').value.trim(),
     ...(oKey ? { openaiKey: oKey } : {}),

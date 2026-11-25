@@ -121,6 +121,99 @@ async function engineQoder(q) {
   });
 }
 
+/**
+ * qoder 视觉引擎：把原图直接交给模型看，跳过 OCR。
+ *
+ * 为什么需要它：RapidOCR 只能抄出文字。遇到几何图（坐标系/电路图/几何证明）、
+ * 化学结构式、带下划线的完形填空时，OCR 出来的是一堆散落的标注文字，题干语义
+ * 全丢了 —— 模型拿着残渣猜，正确率还不如不答。
+ *
+ * 而视觉模型能直接理解图里的几何关系。实测同一张 1080x2400 截图，
+ * dfmodel/gmodel_latest/mmodel 都能准确读出内容，3-7s 出结果。
+ *
+ * 代价：一张 1080x2400 的 PNG 转 base64 约 330KB，比 OCR 的纯文本贵得多，
+ * 所以只在 OCR 判定「读不出题干」时才走这条路（见 shouldUseVision）。
+ */
+async function engineQoderVision(q, image) {
+  const b64 = await imageToBase64(image);
+  if (!b64) throw new Error('图片解码失败');
+  if (b64.startsWith('__SVG__')) throw new Error('SVG 应走文本抽取，不需要视觉');
+
+  const mime = detectImageMime(b64);
+  const url = `data:${mime};base64,${b64}`;
+
+  const typeHint = {
+    single: '这是单选题。只输出 JSON：{"index":<0基选项序号>}',
+    multi: '这是多选题。只输出 JSON：{"indices":[<0基选项序号>,...]}',
+    judge: '这是判断题。只输出 JSON：{"index":0} 表示「对/正确」，{"index":1} 表示「错/错误」',
+    blank: `这是填空题，共 ${q.blankCount || 1} 空。只输出 JSON：{"answers":["第1空内容","第2空内容"]}`,
+    short: '这是简答题。只输出 JSON：{"text":"答案正文"}',
+  }[q.type] || '只输出 JSON。';
+
+  const optText = (q.options || [])
+    .map((o, i) => `${String.fromCharCode(65 + i)}. ${o.text}`)
+    .join('\n');
+
+  const ask = [
+    '看这张手机截图，回答其中的题目。',
+    q.stem ? `题干（OCR 结果，可能不全）：${q.stem}` : '题干在图里，请自己读。',
+    optText ? `选项：\n${optText}` : '',
+    '如果图里有几何图形、坐标轴、电路图、化学结构式等，请结合图形作答。',
+  ].filter(Boolean).join('\n');
+
+  return qoderChat(
+    [
+      {
+        role: 'system',
+        content: `你是答题助手，回答中国高校在线课程的客观题。\n${typeHint}\n`
+          + '只输出 JSON，不要解释、不要复述题目、不要 markdown 代码块。',
+      },
+      { role: 'user', content: ask },
+    ],
+    {
+      model: process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel',
+      images: [url],
+      timeoutMs: Number(process.env.ANSWER_VL_TIMEOUT_MS || 90000),
+    },
+  );
+}
+
+/** 从 base64 头部嗅探图片类型；视觉通道要求 data URI 的 mime 正确 */
+function detectImageMime(b64) {
+  const head = b64.slice(0, 16);
+  if (head.startsWith('/9j/')) return 'image/jpeg';
+  if (head.startsWith('iVBORw0KGgo')) return 'image/png';
+  if (head.startsWith('R0lGOD')) return 'image/gif';
+  if (head.startsWith('UklGR')) return 'image/webp';
+  return 'image/png';
+}
+
+/**
+ * 判断该不该走视觉：OCR 出来的东西「不足以当题干」时才走。
+ *
+ * 判据是「有效中文字数」而不是总长度 —— OCR 噪声（时间、电量、KB/s、
+ * 上一题的残留）都是短碎片，加起来也不短，但有效信息为零。
+ */
+function shouldUseVision(q, ocrText) {
+  if (process.env.ANSWER_VISION === '0') return false;
+  if (!q || !q.stem) return true;              // 压根没读到题干
+  const cleaned = cleanOcrText(ocrText || '');
+  // 有效汉字数：排除 ASCII、标点、空白
+  const han = (cleaned.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const minHan = Number(process.env.ANSWER_VISION_MIN_HAN || 8);
+  if (han < minHan) {
+    console.log(`[vision] OCR 有效汉字 ${han} < ${minHan}，改走视觉`);
+    return true;
+  }
+  // 题干里出现这些词，基本可以确定是图形题，OCR 抄不出图
+  const graphicHint = /如图|下图|上图|图中|图示|坐标|曲线|电路|结构式|几何|阴影|面积|周长|求值/;
+  if (graphicHint.test(q.stem)) {
+    console.log('[vision] 题干含图形提示词，改走视觉');
+    return true;
+  }
+  return false;
+}
+
 /** OpenAI 兼容引擎 */
 async function engineOpenAI(q) {
   const base = process.env.OPENAI_BASE;
@@ -384,8 +477,10 @@ function cleanOcrText(ocrText) {
  * @param {string} text 整屏 a11y 文本（OCR 结果会被追加到后面）
  * @param {object|null} preStructured 手机端区域抽取结果
  * @param {string} ocrText OCR 识别出的文字（无图题时为空串）
+ * @param {boolean} force 主动识别（Vol- 长按），跳过「是不是答题页」闸门
+ * @param {string} imageForVision 原图（base64/data URI/http URL），供视觉模型兜底
  */
-async function solve(text, preStructured, ocrText = '', force = false) {
+async function solve(text, preStructured, ocrText = '', force = false, imageForVision = '') {
   // 手机端 a11y 区域抽取优先；没有或解析失败才退回整屏文本解析
   let structured;
   const structStem = String(preStructured?.stem || '').trim();
@@ -512,11 +607,30 @@ async function solve(text, preStructured, ocrText = '', force = false) {
 
   // 2. 模型
   let raw;
+  // 图片题分流：OCR 读不出题干（图形题/结构式/OCR 挂了）时，直接把原图交给视觉模型。
+  // 必须放在缓存之后 —— 同一题第二次长按时命中缓存，不必再烧一次图片 token。
+  const useVision = !!imageForVision && shouldUseVision(q, ocrText);
   try {
-    raw = await engine(q);
+    if (useVision) {
+      console.log(`[vision] 走视觉模型 model=${process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel'}`);
+      raw = await engineQoderVision(q, imageForVision);
+    } else {
+      raw = await engine(q);
+    }
   } catch (e) {
-    console.error(`[engine] ${engineMode} failed: ${e.message}`);
-    return { answer: '引擎错误: ' + e.message, source: 'error', question: q, structured };
+    console.error(`[engine] ${useVision ? 'vision' : engineMode} failed: ${e.message}`);
+    // 视觉失败时退回文本引擎，别让整题直接报错
+    if (useVision) {
+      try {
+        console.log('[vision] 失败，退回文本引擎');
+        raw = await engine(q);
+      } catch (e2) {
+        console.error(`[engine] ${engineMode} 也失败: ${e2.message}`);
+        return { answer: '引擎错误: ' + e.message, source: 'error', question: q, structured };
+      }
+    } else {
+      return { answer: '引擎错误: ' + e.message, source: 'error', question: q, structured };
+    }
   }
 
   // 3. 归一化
@@ -528,8 +642,9 @@ async function solve(text, preStructured, ocrText = '', force = false) {
     cache.put(q, normalized, (engineMode === 'openai' || engineMode === 'qoder') ? 'ai' : engineMode);
   }
 
-  console.log(`[${engineMode}] ${q.type} q="${String(q.stem).slice(0, 40)}" raw="${raw.slice(0, 60)}" => ${rendered}`);
-  return { answer: rendered, source: engineMode, question: q, structured, normalized };
+  const srcTag = useVision ? 'vision' : engineMode;
+  console.log(`[${srcTag}] ${q.type} q="${String(q.stem).slice(0, 40)}" raw="${raw.slice(0, 60)}" => ${rendered}`);
+  return { answer: rendered, source: srcTag, question: q, structured, normalized };
 }
 
 // ─────────────────────────── HTTP ───────────────────────────
@@ -565,6 +680,12 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         engine: engineMode,
         requested: engineReq,
+        vision: {
+          enabled: process.env.ANSWER_VISION !== '0',
+          model: process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel',
+          minHan: Number(process.env.ANSWER_VISION_MIN_HAN || 8),
+        },
+        ocr: OCR_URL || 'disabled',
         cache: cache ? cache.stats() : null,
         uptime: Math.round(process.uptime()),
       });
@@ -625,7 +746,8 @@ const server = http.createServer(async (req, res) => {
         ocrText = await ocrImage(image);
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
-      const r = await solve(text, structured, ocrText, force);
+      // 原图同时留给视觉模型：OCR 读不出题干时直接让模型看图
+      const r = await solve(text, structured, ocrText, force, image || '');
       const from = req.socket.remoteAddress || '-';
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`
         + ` force=${force} from=${from}`);
@@ -654,6 +776,8 @@ const server = http.createServer(async (req, res) => {
 export const __test_imageToBase64 = imageToBase64;
 export const __test_textFromSvg = textFromSvg;
 export const __test_cleanOcrText = cleanOcrText;
+export const __test_shouldUseVision = shouldUseVision;
+export const __test_detectImageMime = detectImageMime;
 
 if (process.env.ANSWER_NO_LISTEN !== '1') {
   server.listen(PORT, BIND, () => {

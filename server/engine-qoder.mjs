@@ -79,9 +79,46 @@ export async function qoderModels(region = 'cn') {
 }
 
 /**
+ * 把图片数组塞进最后一条 user 消息的 content。
+ *
+ * 插件的 convertIncomingMessage 只认「OpenAI 形状」的 content 数组：
+ *   content: [{type:'text', text}, {type:'image_url', image_url:{url}}]
+ * 它会调 extractMessageImages 把 image_url.url 抽出来，再调 userMessage(text, images)
+ * 转成 Qoder 网关要的 contents 结构。所以这里只需要构造标准 OpenAI 形状。
+ *
+ * 注意：不能把图片单独发成一条消息 —— extractMessageImages 只看 role==='user'
+ * 的那条，而网关要求同一条消息里既有文字又有图。
+ *
+ * @param {Array} messages
+ * @param {string[]} images data:image/...;base64,... 或 http(s) URL
+ * @returns {Array} 新数组（不改原 messages）
+ */
+function attachImages(messages, images) {
+  if (!Array.isArray(images) || images.length === 0) return messages;
+  const out = messages.map((m) => ({ ...m }));
+  const last = out[out.length - 1];
+  if (!last || last.role !== 'user') {
+    out.push({ role: 'user', content: '' });
+  }
+  const target = out[out.length - 1];
+  const text = typeof target.content === 'string'
+    ? target.content
+    : (Array.isArray(target.content)
+      ? target.content.filter((p) => p && typeof p.text === 'string').map((p) => p.text).join('\n')
+      : '');
+  target.content = [
+    { type: 'text', text },
+    ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+  ];
+  return out;
+}
+
+/**
  * 一次性对话（拼 SSE 增量）
- * @param {Array<{role:string, content:string}>} messages
- * @param {{model?:string, signal?:AbortSignal, timeoutMs?:number}} opts
+ * @param {Array<{role:string, content:string|Array}>} messages
+ * @param {{model?:string, signal?:AbortSignal, timeoutMs?:number,
+ *          isVl?:boolean, images?:string[], isReasoning?:boolean}} opts
+ *   images 非空时自动打开 isVl（视觉通道），除非显式给 isVl:false
  * @returns {Promise<string>}
  */
 export async function qoderChat(messages, opts = {}) {
@@ -90,16 +127,20 @@ export async function qoderChat(messages, opts = {}) {
   const modelKey = opts.model || process.env.QODER_MODEL || 'dfmodel';
   const timeoutMs = opts.timeoutMs ?? 90_000;
 
+  const hasImages = Array.isArray(opts.images) && opts.images.length > 0;
+  const isVl = opts.isVl ?? hasImages;
+  const payload = attachImages(messages, opts.images);
+
   let buf = '';
   let err = null;
 
   const timer = setTimeout(() => { err = err || new Error(`qoder 超时 ${timeoutMs}ms`); }, timeoutMs);
 
   try {
-    await client.chatStream(_pat, modelKey, messages, {
+    await client.chatStream(_pat, modelKey, payload, {
       userType: opts.userType || 'personal_standard',
-      isVl: false,
-      isReasoning: false,
+      isVl,
+      isReasoning: opts.isReasoning === true,
       onDelta(delta) {
         if (typeof delta === 'string') { buf += delta; return; }
         if (delta && typeof delta.content === 'string') buf += delta.content;
@@ -130,6 +171,20 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
     const q = process.argv[3] || '只回复两个字：收到';
     const t0 = Date.now();
     const out = await qoderChat([{ role: 'user', content: q }]);
+    console.log(`${Date.now() - t0}ms -> ${out}`);
+  } else if (mode === 'vl') {
+    // 视觉通道自检：node --import ./dsh-resolve-register.mjs engine-qoder.mjs vl <图片路径>
+    // 不给路径就用内置 1x1 红点，验证 isVl 通道能通（不通会抛 provider_error）。
+    const imgPath = process.argv[3];
+    const url = imgPath
+      ? 'data:image/png;base64,' + readFileSync(imgPath).toString('base64')
+      : 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ'
+        + 'AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const t0 = Date.now();
+    const out = await qoderChat(
+      [{ role: 'user', content: '这张图里有什么？只回一句话。' }],
+      { model: process.env.QODER_MODEL || 'dfmodel', images: [url], timeoutMs: 60_000 },
+    );
     console.log(`${Date.now() - t0}ms -> ${out}`);
   }
 }

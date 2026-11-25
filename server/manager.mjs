@@ -46,6 +46,11 @@ const DEFAULT_CONFIG = {
   qoderPat: '',             // 留空 = 用 ~/.dsh/.qoder-accounts.cn.json
   qoderRegion: 'cn',        // cn | global
   timeoutMs: 90000,
+  // 图片题视觉兜底：OCR 读不出题干时把原图直接交给视觉模型
+  vision: true,             // false = 只走 OCR，不调视觉模型
+  vlModel: '',              // 留空 = 用 qoderModel；实测 dfmodel/gmodel_latest/mmodel 都支持看图
+  visionMinHan: 8,          // OCR 有效汉字低于这个数就判为「读不出题干」
+  visionTimeoutMs: 90000,
   // OpenAI 兼容 API
   openaiBase: '',
   openaiKey: '',
@@ -86,6 +91,12 @@ function buildEnv() {
     if (config.qoderRegion === 'global') env.QODER_PAT_GLOBAL = config.qoderPat;
     else { env.QODER_PAT_CN = config.qoderPat; env.QODER_PAT = config.qoderPat; }
   }
+  // 视觉兜底：这三项必须显式传，否则子进程只能吃 DEFAULT_CONFIG 里的值，
+  // 而 DEFAULT_CONFIG 是 manager 自己的常量，改了不生效。
+  env.ANSWER_VISION = config.vision === false ? '0' : '1';
+  if (config.vlModel) env.QODER_VL_MODEL = config.vlModel;
+  if (config.visionMinHan != null) env.ANSWER_VISION_MIN_HAN = String(config.visionMinHan);
+  if (config.visionTimeoutMs) env.ANSWER_VL_TIMEOUT_MS = String(config.visionTimeoutMs);
   if (config.openaiBase) env.OPENAI_BASE = config.openaiBase;
   if (config.openaiKey) env.OPENAI_KEY = config.openaiKey;
   if (config.openaiModel) env.OPENAI_MODEL = config.openaiModel;

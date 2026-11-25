@@ -30,13 +30,21 @@ if defined PY (
   powershell -NoProfile -Command "try{(Invoke-RestMethod 'http://127.0.0.1:18890/health' -TimeoutSec 2)|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
   if errorlevel 1 (
     echo [3/6] starting OCR service :18890 ...
-    start "cx-ocr" /min cmd /c "%PY% "%~dp0server\ocr_server.py""
-    timeout /t 6 /nobreak >nul
+    rem 引号嵌套：%PY% 可能是 "py -3"（含空格），直接塞进 cmd /c "..." 会让内层引号
+    rem 提前闭合，实际执行变成 `py -3 ` + 空路径。改成先 cd 再裸跑文件名。
+    start "cx-ocr" /min cmd /c "cd /d "%~dp0server" && %PY% ocr_server.py"
+    timeout /t 8 /nobreak >nul
+    powershell -NoProfile -Command "try{(Invoke-RestMethod 'http://127.0.0.1:18890/health' -TimeoutSec 3)|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
+    if errorlevel 1 (
+      echo     WARN: OCR service did not come up. Image questions will fall back to vision model.
+    ) else (
+      echo     OCR OK ^(RapidOCR, local^)
+    )
   ) else (
     echo [3/6] OCR service already running
   )
 ) else (
-  echo [3/6] OCR skipped
+  echo [3/6] OCR skipped - install: pip install rapidocr_onnxruntime
 )
 
 rem --- manager: reuse if already running (a second one would fail to bind) ---

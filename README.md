@@ -148,6 +148,37 @@ powershell -ExecutionPolicy Bypass -File xposed\build-module.ps1
 
 > OCR 依赖：`pip install rapidocr_onnxruntime`（已在本机 Python 3.13 验证）。
 
+### 图片题视觉兜底（2026-11-25，OCR 之上）
+
+OCR 只做「像素 → 字符」映射，遇到几何图/坐标系/电路图/化学结构式就废了 ——
+实测一张直角三角形题，OCR 输出 `ABC BC = 90 AC = 3 GBC = 40 AB A5`，
+三角形本身完全消失，模型只能猜（答出 `A 6`，正解 5）。
+
+现在 OCR 读不出题干时，**把原图直接交给视觉模型**。图片本来就传到了 PC，
+只是之前只喂给 OCR，模型从没见过它。
+
+分流判据（`shouldUseVision`）：
+
+| 判据 | 说明 |
+|---|---|
+| `q.stem` 为空 | 压根没读到题干 |
+| 有效汉字 < 8 | 用**汉字数**不是总长度：OCR 噪声都是短碎片，拼起来不短但信息为零 |
+| 题干含图形提示词 | 如图/下图/图中/坐标/曲线/电路/结构式/几何/阴影/面积/周长 |
+
+分流在**缓存之后**：同一题第二次长按命中缓存，不重复烧图片 token。视觉失败自动退回文本引擎。
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `ANSWER_VISION` | `1` | `0` = 只走 OCR |
+| `QODER_VL_MODEL` | 空 → 用 `QODER_MODEL` | 视觉模型 key |
+| `ANSWER_VISION_MIN_HAN` | `8` | 有效汉字阈值 |
+| `ANSWER_VL_TIMEOUT_MS` | `90000` | 视觉超时 |
+
+模型实测（真实 1080×2400 截图）：`dfmodel` 3.1s ✅ / `gmodel_latest` 3.9s ✅ /
+`mmodel` 3.6s ✅ / `kmodel_latest` 19.5s ⚠️ / `qmodel_latest` HTTP 400 ❌ 不支持 VL。
+
+实测几何题：`source=vision` → **A 5**（正确），5.3s。详见 `docs/22-图片题视觉兜底.md`。
+
 ### 图片题 URL 直取（2026-11-24，优先于 OCR）
 
 a11y 的 `Image` 节点 `extras` 里有 `AccessibilityNodeInfo.targetUrl`，就是图片地址
