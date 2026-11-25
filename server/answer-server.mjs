@@ -712,6 +712,130 @@ function json(res, obj, code = 200) {
   res.end(s);
 }
 
+// ─────────────────────────── 推送通道（电脑 → 手机）───────────────────────────
+//
+// 手机端不监听任何端口（App 里没有 ServerSocket），所以电脑无法主动连手机。
+// 要「电脑推消息给手机」只能反过来：手机来取。这里做一个队列 + 长轮询：
+//
+//   POST /push          电脑把消息放进队列（body: {text, kind})
+//   GET  /pull?since=N  手机来取（since=上次拿到的序号，长轮询最多挂 25s）
+//   GET  /push          手机浏览器直接打开的接收页（SSE 都不用，定时轮询即可）
+//
+// 为什么用队列而不是直接长轮询单条：长按/多题连发时消息会叠，队列保证不丢。
+
+const PUSH_MAX = 200;
+const PUSH_WAIT_MS = 25000;
+let pushSeq = 0;
+const pushQueue = [];        // {seq, text, kind, at}
+const pushWaiters = [];      // {res, since, timer}
+
+function pushAdd(text, kind = 'info') {
+  pushSeq += 1;
+  const item = { seq: pushSeq, text: String(text ?? ''), kind: String(kind || 'info'), at: Date.now() };
+  pushQueue.push(item);
+  if (pushQueue.length > PUSH_MAX) pushQueue.splice(0, pushQueue.length - PUSH_MAX);
+  // 叫醒所有挂着等消息的长轮询
+  for (const w of pushWaiters.slice()) {
+    const got = pushQueue.filter((m) => m.seq > w.since);
+    if (got.length) pushFlush(w, got);
+  }
+  return item;
+}
+
+function pushFlush(waiter, items) {
+  const i = pushWaiters.indexOf(waiter);
+  if (i < 0) return;                    // 已经被超时清掉了
+  pushWaiters.splice(i, 1);
+  if (waiter.timer) clearTimeout(waiter.timer);
+  try {
+    json(waiter.res, { ok: true, seq: pushSeq, items });
+  } catch { /* 手机已经断开，忽略 */ }
+}
+
+/** 取出 since 之后的消息；没有就挂最多 PUSH_WAIT_MS */
+function pushWait(res, since) {
+  const items = pushQueue.filter((m) => m.seq > since);
+  if (items.length) {
+    json(res, { ok: true, seq: pushSeq, items });
+    return;
+  }
+  const waiter = { res, since, timer: null };
+  pushWaiters.push(waiter);
+  waiter.timer = setTimeout(() => {
+    // 超时返回空数组 —— 手机端拿到空数组就立刻再发一次，形成长轮询
+    const i = pushWaiters.indexOf(waiter);
+    if (i >= 0) pushWaiters.splice(i, 1);
+    try { json(res, { ok: true, seq: pushSeq, items: [] }); } catch { /* ignore */ }
+  }, PUSH_WAIT_MS);
+  // 手机中途断开时别让 waiter 一直挂着
+  res.on('close', () => {
+    const i = pushWaiters.indexOf(waiter);
+    if (i >= 0) {
+      pushWaiters.splice(i, 1);
+      if (waiter.timer) clearTimeout(waiter.timer);
+    }
+  });
+}
+
+/** 手机浏览器直接打开的接收页 */
+const PUSH_PAGE = `<!doctype html><html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>电脑推送</title><style>
+:root{color-scheme:dark}
+body{margin:0;padding:16px;background:#0d1117;color:#e6edf3;
+  font:16px/1.6 -apple-system,"Noto Sans SC",sans-serif}
+h1{font-size:16px;font-weight:600;margin:0 0 4px;color:#8b949e}
+#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#f85149;margin-right:6px}
+#dot.on{background:#3fb950}
+#list{margin-top:14px;display:flex;flex-direction:column;gap:10px}
+.item{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px 14px;
+  word-break:break-word;white-space:pre-wrap}
+.item .meta{font-size:12px;color:#8b949e;margin-bottom:6px}
+.item.ok{border-color:#238636}
+.item.err{border-color:#da3633}
+.item.answer{font-size:20px;font-weight:600;color:#58a6ff}
+</style></head><body>
+<h1><span id="dot"></span>电脑推送 · <span id="stat">连接中…</span></h1>
+<div id="list"></div>
+<script>
+let since = 0;
+const list = document.getElementById('list');
+const dot = document.getElementById('dot');
+const stat = document.getElementById('stat');
+function add(m){
+  const d = document.createElement('div');
+  d.className = 'item ' + (m.kind === 'answer' ? 'answer' : m.kind === 'error' ? 'err' : m.kind === 'ok' ? 'ok' : '');
+  const t = new Date(m.at).toLocaleTimeString('zh-CN');
+  d.innerHTML = '<div class="meta">' + t + ' · #' + m.seq + '</div>';
+  const body = document.createElement('div');
+  body.textContent = m.text;
+  d.appendChild(body);
+  list.insertBefore(d, list.firstChild);
+  while (list.children.length > 50) list.removeChild(list.lastChild);
+  if (navigator.vibrate) navigator.vibrate(60);
+}
+async function tick(){
+  try{
+    const r = await fetch('/pull?since=' + since, {cache:'no-store'});
+    const j = await r.json();
+    dot.className = 'dot on';
+    stat.textContent = '已连接';
+    if (j.items && j.items.length){
+      for (const m of j.items) add(m);
+      since = j.seq;
+    } else if (j.seq != null && j.seq > since) {
+      since = j.seq;
+    }
+  }catch(e){
+    dot.className = 'dot';
+    stat.textContent = '断开，重试中';
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  tick();
+}
+tick();
+</script></body></html>`;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
 
@@ -757,6 +881,32 @@ const server = http.createServer(async (req, res) => {
       return json(res, { ok: true, cleared: true });
     }
 
+    // ── 推送通道：电脑 → 手机 ──
+    if (url.pathname === '/push' && req.method === 'POST') {
+      const body = await readBody(req);
+      let text = '';
+      let kind = 'info';
+      try {
+        const j = JSON.parse(body);
+        text = j.text != null ? String(j.text) : String(body);
+        kind = j.kind || 'info';
+      } catch { text = body; }
+      const item = pushAdd(text, kind);
+      console.log(`[push] #${item.seq} kind=${item.kind} ${String(text).slice(0, 60)}`);
+      return json(res, { ok: true, ...item });
+    }
+    if (url.pathname === '/push' && req.method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      return res.end(PUSH_PAGE);
+    }
+    if (url.pathname === '/pull' && req.method === 'GET') {
+      const since = Number(url.searchParams.get('since') || 0) || 0;
+      return pushWait(res, since);
+    }
+
     if (req.method === 'POST' && url.pathname === '/parse') {
       const body = await readBody(req);
       let text = '';
@@ -792,6 +942,14 @@ const server = http.createServer(async (req, res) => {
       const from = req.socket.remoteAddress || '-';
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`
         + ` force=${force} from=${from}`);
+      // 顺手推一条到推送队列：手机端如果用浏览器看着推送页，能看到同一份答案。
+      // 不推 source=none 的空结果（那是「这屏不是答题页」，没信息量）。
+      if (r.source !== 'none') {
+        pushAdd(
+          `${r.answer}\n\n[${r.source} · ${r.question?.type || '-'} · ${Date.now() - t0}ms]`,
+          r.source === 'error' ? 'error' : 'answer',
+        );
+      }
       return json(res, {
         answer: r.answer,
         source: r.source,
