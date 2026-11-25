@@ -157,7 +157,11 @@ async function engineQoderVision(q, image) {
   const ask = [
     '看这张手机截图，回答其中的题目。',
     q.stem ? `题干（OCR 结果，可能不全）：${q.stem}` : '题干在图里，请自己读。',
-    optText ? `选项：\n${optText}` : '',
+    optText
+      ? `选项：\n${optText}`
+      // 图片题常见：a11y 抽不到选项（选项也画在图里）。必须让模型自己数，
+      // 否则它会给出一个我们无法映射回字母的下标。
+      : '选项也画在图里，请自己读出选项个数，index 从 0 开始按图中 A/B/C/D 顺序计。',
     '如果图里有几何图形、坐标轴、电路图、化学结构式等，请结合图形作答。',
   ].filter(Boolean).join('\n');
 
@@ -193,16 +197,22 @@ function detectImageMime(b64) {
  *
  * 判据是「有效中文字数」而不是总长度 —— OCR 噪声（时间、电量、KB/s、
  * 上一题的残留）都是短碎片，加起来也不短，但有效信息为零。
+ *
+ * 重要：汉字数要在 **stem 和 ocrText 里取较大者**。只看 ocrText 会误判 ——
+ * 典型场景是 a11y 已经读到了完整题干（文字题），但 OCR 服务没起/超时，
+ * ocrText 为空，于是被判成「读不出题干」白烧一次图片 token。
  */
 function shouldUseVision(q, ocrText) {
   if (process.env.ANSWER_VISION === '0') return false;
   if (!q || !q.stem) return true;              // 压根没读到题干
-  const cleaned = cleanOcrText(ocrText || '');
-  // 有效汉字数：排除 ASCII、标点、空白
-  const han = (cleaned.match(/[\u4e00-\u9fa5]/g) || []).length;
+
+  const countHan = (s) => (String(s || '').match(/[\u4e00-\u9fa5]/g) || []).length;
+  const hanStem = countHan(q.stem);
+  const hanOcr = countHan(cleanOcrText(ocrText || ''));
+  const han = Math.max(hanStem, hanOcr);
   const minHan = Number(process.env.ANSWER_VISION_MIN_HAN || 8);
   if (han < minHan) {
-    console.log(`[vision] OCR 有效汉字 ${han} < ${minHan}，改走视觉`);
+    console.log(`[vision] 有效汉字 ${han}（stem=${hanStem} ocr=${hanOcr}）< ${minHan}，改走视觉`);
     return true;
   }
   // 题干里出现这些词，基本可以确定是图形题，OCR 抄不出图
@@ -277,7 +287,13 @@ function renderAnswer(ans, q) {
   if (p.indicesJson) {
     let idx = [];
     try { idx = JSON.parse(p.indicesJson); } catch { /* ignore */ }
-    return idx.map((i) => {
+    if (!Array.isArray(idx)) idx = [];
+    const optsLen = opts.length;
+    const valid = idx.filter((i) => Number.isInteger(i) && i >= 0 && (optsLen === 0 || i < optsLen));
+    if (valid.length !== idx.length) {
+      console.error(`[render] indices 越界 ${JSON.stringify(idx)}（选项 ${optsLen} 个），已过滤`);
+    }
+    return valid.map((i) => {
       const L = String.fromCharCode(65 + i);
       const t = opts[i] ? ` ${opts[i].text}` : '';
       return L + t;
@@ -285,6 +301,12 @@ function renderAnswer(ans, q) {
   }
   if (p.selectedIndex != null) {
     const i = Number(p.selectedIndex);
+    // 越界保护：视觉模型看图数选项时可能给出超出范围的下标，
+    // String.fromCharCode(65+5) 会渲染成 "F" —— 4 个选项的题出现 F 是明显错误。
+    if (!Number.isInteger(i) || i < 0 || (opts.length > 0 && i >= opts.length)) {
+      console.error(`[render] selectedIndex=${p.selectedIndex} 越界（选项 ${opts.length} 个），丢弃`);
+      return '';
+    }
     const L = String.fromCharCode(65 + i);
     const t = opts[i] ? ` ${opts[i].text}` : '';
     return `${L}${t}`;
@@ -637,9 +659,28 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
   const normalized = parseAnswerText(raw, q);
   const rendered = renderAnswer(normalized, q);
 
+  // 渲染出空串 = 模型给了越界下标之类无法映射的结果。别把空答案交给手机端
+  // （浮层会显示空白，用户以为卡住了），明确报出来。
+  if (!rendered) {
+    console.error(`[render] 空答案 raw="${String(raw).slice(0, 120)}" type=${q.type} opts=${(q.options || []).length}`);
+    return {
+      answer: '模型回答格式异常，请再按一次',
+      source: 'error',
+      question: q,
+      structured,
+      normalized,
+    };
+  }
+
   // 4. 回写缓存
+  // 注意：图片题（stem 为空）不写缓存 —— normalizeForHash 返回 null，
+  // cache.put 直接跳过。否则所有选项相同的图片题会共用一个键、互相污染。
+  // source 用实际出答案的通道，不能照抄 engineMode：视觉答案记成 heuristic
+  // 会让 /stats 的来源分布失真。
   if (cache && normalized.type !== 'short') {
-    cache.put(q, normalized, (engineMode === 'openai' || engineMode === 'qoder') ? 'ai' : engineMode);
+    const src = useVision ? 'vision' : ((engineMode === 'openai' || engineMode === 'qoder') ? 'ai' : engineMode);
+    const wrote = cache.put(q, normalized, src);
+    if (!wrote) console.log('[cache] 空题干，跳过缓存写入');
   }
 
   const srcTag = useVision ? 'vision' : engineMode;
@@ -778,6 +819,7 @@ export const __test_textFromSvg = textFromSvg;
 export const __test_cleanOcrText = cleanOcrText;
 export const __test_shouldUseVision = shouldUseVision;
 export const __test_detectImageMime = detectImageMime;
+export const __test_renderAnswer = renderAnswer;
 
 if (process.env.ANSWER_NO_LISTEN !== '1') {
   server.listen(PORT, BIND, () => {

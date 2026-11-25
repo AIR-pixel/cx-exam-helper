@@ -573,12 +573,23 @@ export function parseStructured(s) {
 
 // ─────────────────────────── 去重键 ───────────────────────────
 
-/** 归一化题目 → 稳定哈希（题干去标点空白 + 选项排序） */
+/**
+ * 归一化题目 → 稳定哈希（题干去标点空白 + 选项排序）
+ *
+ * 图片题的坑：题干在像素里，a11y 抽不到，`q.stem` 是空串。此时哈希只剩选项，
+ * 于是「所有选项相同的图片题」共用一个键 —— 缓存会把 A 题的答案喂给 B 题。
+ * 实测两个不同的空 stem 题（4 选项完全相同）哈希完全一致。
+ *
+ * 所以图片题（stem 归一化后为空）不能进缓存：没有题干就没有去重依据。
+ * 返回 null 表示「不可缓存」，调用方（AnswerCache.get/put）必须跳过。
+ */
 export function normalizeForHash(q) {
   const stem = String(q.stem || '')
     .replace(/[\s\u3000]+/g, '')
     .replace(/[，。、；：？！,.;:?!'"''""（）()【】\[\]]/g, '')
     .toLowerCase();
+  // 空题干 = 图片题/OCR 失败，没有可去重的语义，禁止入缓存
+  if (!stem) return null;
   const opts = (q.options || [])
     .map((o) => String(o.text || '').replace(/[\s\u3000]/g, '').toLowerCase())
     .join('|');

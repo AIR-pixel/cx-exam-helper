@@ -79,6 +79,8 @@ export class AnswerCache {
    */
   get(q) {
     const key = normalizeForHash(q);
+    // 图片题/空题干：没有去重依据，一律不命中（见 normalizeForHash 注释）
+    if (!key) return null;
     const row = this._stmtGet.get(key);
     if (!row) return null;
     const now = Date.now();
@@ -99,9 +101,12 @@ export class AnswerCache {
    * @param {object} q 结构化题目
    * @param {object} answer 归一化作答参数 { mode, type, params }
    * @param {string} [source] ai | ocs | manual
+   * @returns {string|null} 写入的键；空题干返回 null（未写入）
    */
   put(q, answer, source = 'ai') {
     const key = normalizeForHash(q);
+    // 空题干（图片题）不写缓存：否则所有选项相同的图片题会互相污染
+    if (!key) return null;
     const now = Date.now();
     this._stmtPut.run(
       key,
@@ -119,6 +124,7 @@ export class AnswerCache {
   /** 删一条（调试用） */
   delete(q) {
     const key = normalizeForHash(q);
+    if (!key) return null;
     this.db.prepare('DELETE FROM questions WHERE qkey = ?').run(key);
     return key;
   }

@@ -129,6 +129,82 @@ t('空串 → 默认 png（不抛）', () => {
   assert.equal(detectImageMime(''), 'image/png');
 });
 
+console.log('\n=== 7. 回归：OCR 为空但 stem 完整时不该误判（review 修复）===');
+// 场景：a11y 读到了完整题干（文字题），但 OCR 服务没起/超时 → ocrText 为空。
+// 修复前只看 ocrText 的汉字数 → 判成「读不出题干」→ 白烧一次图片 token。
+t('stem 27 个汉字 + ocrText 空 → 不走视觉', () => {
+  const stem = '下列哪一项属于应用层协议，请从四个选项中选择一个正确答案';
+  assert.equal(shouldUseVision({ stem }, ''), false);
+});
+t('stem 27 个汉字 + ocrText 为空串以外的假值 → 不走视觉', () => {
+  const stem = '下列哪一项属于应用层协议，请从四个选项中选择一个正确答案';
+  assert.equal(shouldUseVision({ stem }, null), false);
+});
+t('stem 和 ocrText 都短 → 仍走视觉', () => {
+  assert.equal(shouldUseVision({ stem: 'AB' }, 'CD'), true);
+});
+t('stem 短但 ocrText 长 → 取较大者，不走视觉', () => {
+  const ocr = '这是一段足够长的识别文本包含很多汉字内容';
+  assert.equal(shouldUseVision({ stem: 'AB' }, ocr), false);
+});
+
+console.log('\n=== 8. 回归：选项越界索引（review 修复）===');
+const renderAnswer = mod.__test_renderAnswer;
+const q4 = {
+  type: 'single',
+  stem: '题干',
+  options: [{ text: '传输层' }, { text: '网络层' }, { text: '数据链路层' }, { text: '物理层' }],
+};
+t('index=0 → A 传输层', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 0 } }, q4), 'A 传输层');
+});
+t('index=3 → D 物理层', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 3 } }, q4), 'D 物理层');
+});
+t('index=5 越界 → 空串（不渲染成 F）', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 5 } }, q4), '');
+});
+t('index=-1 → 空串', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: -1 } }, q4), '');
+});
+t('index=1.5 非整数 → 空串', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 1.5 } }, q4), '');
+});
+t('多选 indices 越界被过滤', () => {
+  const out = renderAnswer(
+    { mode: 'json', params: { indicesJson: '[0,2,7]' } },
+    { ...q4, type: 'multi' },
+  );
+  assert.equal(out, 'A 传输层 ; C 数据链路层');
+});
+t('多选全越界 → 空串', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { indicesJson: '[9,10]' } }, q4), '');
+});
+
+console.log('\n=== 9. 回归：空 stem 图片题不进缓存（review 修复）===');
+const core = await import('./answer-core.mjs');
+t('空 stem → normalizeForHash 返回 null', () => {
+  assert.equal(core.normalizeForHash({ stem: '', options: [] }), null);
+});
+t('纯标点 stem → 也是 null', () => {
+  assert.equal(core.normalizeForHash({ stem: '。，、', options: [] }), null);
+});
+t('空白 stem → 也是 null', () => {
+  assert.equal(core.normalizeForHash({ stem: '   ', options: [] }), null);
+});
+t('有题干 → 正常返回哈希', () => {
+  const k = core.normalizeForHash({ stem: '题目', options: [{ text: 'A' }] });
+  assert.equal(typeof k, 'string');
+  assert.equal(k.length, 32);
+});
+t('两张不同图片题（空 stem + 相同选项）不再撞键', () => {
+  const a = core.normalizeForHash({ stem: '', options: [{ text: '传输层' }] });
+  const b = core.normalizeForHash({ stem: '', options: [{ text: '传输层' }] });
+  // 都为 null，且 AnswerCache 会把 null 当「不缓存」而不是「同一个键」
+  assert.equal(a, null);
+  assert.equal(b, null);
+});
+
 console.log('\n' + '='.repeat(56));
 if (fail === 0) console.log(`PASS  ${pass} 项通过，全部`);
 else console.log(`FAIL  ${pass} 通过 / ${fail} 失败`);
