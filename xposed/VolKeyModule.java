@@ -184,10 +184,99 @@ public class VolKeyModule implements IXposedHookLoadPackage {
             lastUpDownTime = downTime;
         }
 
-        // Vol+ 不参与任何手势，原样放行（正常调音量）。
-        // 浮层显隐统一由 Vol- 双击负责，两个键各管一件事，不会记混。
+        // Vol+ 双击 → 快速识别（无思考档）；其余情况放行。
         if (code == KeyEvent.KEYCODE_VOLUME_DOWN) {
             onVolDown(e, action, downTime);
+        } else {
+            onVolUp(e, action, downTime);
+        }
+    }
+
+    // ───────────────────────── Vol+ ─────────────────────────
+
+    /**
+     * Vol+ 手势：
+     *   双击 → 快速识别（which=fast，服务端走无思考/浅思考档）
+     *   其余 → 原样放行，正常调音量
+     *
+     * 为什么单独给它一个手势：
+     *   考试场景下最常用的两种模式是「正常答」和「快点答」。Vol- 长按已经占了
+     *   「主动识别」，Vol- 双击/三击占了浮层显隐和总开关 —— Vol- 再叠手势会让
+     *   用户记不住，而且误触代价高（三击和双击只差一下）。
+     *   把「快」放到另一个键上，两个键各管一类：Vol- 管开关，Vol+ 管速度。
+     *
+     * 为什么只做双击、不做单击：
+     *   单击 Vol+ 是用户最常用的调音量动作，拦下来会让音量没法加。
+     *   双击天然是个"刻意动作"，不会误触。
+     */
+    private static void onVolUp(KeyEvent e, int action, long downTime) {
+        long now = System.currentTimeMillis();
+
+        if (action == KeyEvent.ACTION_DOWN) {
+            int repeat = 0;
+            try { repeat = e.getRepeatCount(); } catch (Throwable ignored) {}
+            if (repeat == 0) {
+                // 记下当前音量：双击触发后回滚，否则按两下音量已经加了两格
+                if (volUpTapCount == 0) volUpSavedVolume = readMusicVolume();
+            }
+            return;
+        }
+
+        if (now - lastFireUp < COOLDOWN_MS) return;
+
+        volUpTapCount++;
+        XposedBridge.log(TAG + " Vol+ tap #" + volUpTapCount);
+
+        cancelUpTapDispatch();
+        final int expected = volUpTapCount;
+        upTapDispatch = new Runnable() { public void run() {
+            upTapDispatch = null;
+            int n = volUpTapCount;
+            volUpTapCount = 0;
+            if (n != expected) return;
+            if (n < 2) {
+                // 单击：不拦截，系统已经调过音量了
+                return;
+            }
+            lastFireUp = System.currentTimeMillis();
+            // 双击及以上：把音量还原，用户不该因为按了快捷键而被改音量
+            restoreVolUpVolume();
+            vibrate();
+            XposedBridge.log(TAG + " Vol+ x" + n + " -> fast scan");
+            sendBroadcast("fast");
+        } };
+        postDelayed(upTapDispatch, TAP_WINDOW_MS);
+    }
+
+    /** Vol+ 短按计数器 */
+    private static int volUpTapCount = 0;
+    private static Runnable upTapDispatch = null;
+    private static long lastFireUp = 0;
+    private static int volUpSavedVolume = -1;
+
+    private static void cancelUpTapDispatch() {
+        if (upTapDispatch != null) {
+            removeCallbacks(upTapDispatch);
+            upTapDispatch = null;
+        }
+    }
+
+    private static void restoreVolUpVolume() {
+        if (volUpSavedVolume < 0) return;
+        try {
+            android.content.Context ctx = getSystemContext();
+            if (ctx == null) return;
+            android.media.AudioManager am =
+                    (android.media.AudioManager) ctx.getSystemService(
+                            android.content.Context.AUDIO_SERVICE);
+            if (am == null) return;
+            am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                    volUpSavedVolume, 0);
+            XposedBridge.log(TAG + " Vol+ volume restored to " + volUpSavedVolume);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " Vol+ volume restore err: " + t);
+        } finally {
+            volUpSavedVolume = -1;
         }
     }
 

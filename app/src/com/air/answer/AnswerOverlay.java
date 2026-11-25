@@ -36,8 +36,15 @@ public final class AnswerOverlay {
     // 字号统一调小：meta/status 11→10，答案主体 19→15
     private static final float META_SP = 10f;
     private static final float ANSWER_SP = 15f;
-    // 黑字描边半径（px）：背板近透明后靠它保证可读
-    private static final float OUTLINE_R = 2.5f;
+    /**
+     * 文字黑描边半径。
+     *
+     * 背景现在完全透明（#00000000），描边是唯一的可读性来源，所以给到 8。
+     * 演进：2.5（10% 背板时，糊）→ 6（55% 背板时，够）→ 8（全透明，需要更厚）。
+     * 白字 + 8px 黑边在任何底色（浅色题面/深色夜间模式/彩色图片）上都能读，
+     * 且不产生任何色块遮挡 —— 这就是"背景透明"和"文字可读"能同时成立的原因。
+     */
+    private static final float OUTLINE_R = 8f;
     // 窗口高度上限：短答案自动包内容（WRAP），超长答案封顶后内部自动滚动
     private static final int MAX_ANSWER_HEIGHT = 480;
     /** 空态答案区最小高度（dp）：保证浮层挂上时是一块看得见的实体，不是一条线 */
@@ -56,6 +63,9 @@ public final class AnswerOverlay {
     private final Handler h = new Handler(Looper.getMainLooper());
 
     private LinearLayout card;
+    // 用 TextView + setShadowLayer。试过自绘 OutlineTextView（Paint.Style.STROKE
+    // 描边 + FILL 填字），在 TYPE_ACCESSIBILITY_OVERLAY 窗口里文字完全不显示
+    // （真机截图 ov5/ov6.png：边框在、文字区一片空白），所以退回 TextView。
     private TextView metaView;
     private TextView answerView;
     private TextView statusView;
@@ -95,7 +105,7 @@ public final class AnswerOverlay {
 
             metaView = new TextView(ctx);
             metaView.setText("答案助手 · 等待题目");
-            metaView.setTextColor(Color.parseColor("#CCFFFFFF"));
+            metaView.setTextColor(Color.parseColor("#EEFFFFFF"));
             metaView.setTextSize(TypedValue.COMPLEX_UNIT_SP, META_SP);
             metaView.setSingleLine(true);
             metaView.setShadowLayer(OUTLINE_R, 0f, 0f, Color.BLACK);
@@ -116,14 +126,14 @@ public final class AnswerOverlay {
             // 上界由窗口高度兜（见 relayout），超出才出现滚动。
             answerView.setMovementMethod(new ScrollingMovementMethod());
             answerView.setVerticalScrollBarEnabled(true);
-            // 描边：背板压到近乎透明后，靠这层黑晕在任何背景上都读得清。
+            // 背景透明后靠这层黑晕把字从底下题面里"抠"出来
             answerView.setShadowLayer(OUTLINE_R, 0f, 0f, Color.BLACK);
             // 长答案封顶：超出 MAX_ANSWER_HEIGHT 后内部滚动，不撑爆全屏
             answerView.setMaxHeight(dp(MAX_ANSWER_HEIGHT));
 
             statusView = new TextView(ctx);
             statusView.setText("a11y 已连接");
-            statusView.setTextColor(Color.parseColor("#99FFFFFF"));
+            statusView.setTextColor(Color.parseColor("#CCFFFFFF"));
             statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, META_SP);
             statusView.setSingleLine(true);
             statusView.setShadowLayer(OUTLINE_R, 0f, 0f, Color.BLACK);
@@ -182,9 +192,16 @@ public final class AnswerOverlay {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        // y=200 落在页面「答题进度 05/20」那一行上，叠层和页面文字叠印（真机截图）。
-        // 往下挪到 260，避开标题栏和进度条，仍在第一屏可见区域。
-        lp.y = 260;
+        // y 位置演进：
+        //   200 → 压在「答题进度 05/20」那一行上，叠印
+        //   260 → 避开进度条，但正好盖住 A 选项。背景透明后这不是"遮挡"而是
+        //         "叠印"：浮层的答案文字和底下 A 选项的正文几乎同一位置、
+        //         同一内容（因为答案本来就是 A 选项的原文），看起来像重影，
+        //         用户会以为显示坏了（真机截图 ov7.png）。
+        //   现在用 BOTTOM 贴底：答题页底部通常是「保存/提交/下一题」按钮区，
+        //   题面和选项在中间 —— 浮层贴底就不会和任何选项正文重叠。
+        lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        lp.y = dp(96);
         // 窗口整体不透明度：背板已近透明，这里保持满不透明度保证文字清晰
         lp.alpha = 1.0f;
         // 明确不抢焦点、不拦截触摸：学习通照常可点
@@ -293,23 +310,33 @@ public final class AnswerOverlay {
      *      直接叠印在一起（2026-11-25 真机截图，答案和进度数字糊成一团）。
      *      浮层的唯一职责是让用户看清答案，不是透视题面。
      *
-     * 现在：空态深色实心 + 蓝边（确认在工作）；有答案深色实心 + 灰边（能读清）。
-     * 两档都保证文字对比度，区别只在边框颜色和深浅。
+     * 现在：背景 22% 深色（几乎透明）+ 6px 黑晕，文字可读且题面可透视。
+     *
+     * 演进过程（四次真机截图，别再来回改）：
+     *   1. 10% 半透明 + 2.5px 阴影 → 失败。答案白字与底下题干黑字叠印成乱码。
+     *   2. 完全不透明 → 可读，但把题面遮死，用户看不到自己在选哪个选项。
+     *   3. 55% 半透明 + 6px 阴影 → 仍有重影：「A 第一次握手…」白字和黑字
+     *      同时出现两遍，因为深色块 + 白字 + 底下黑字是三层叠印。
+     *   4. 全透明 #00000000 + 6px 阴影 → 白字变虚影，浅色页面上几乎看不清。
+     *   5. 自绘 OutlineTextView（STROKE 描边）→ 文字完全不显示（overlay 窗口
+     *      里自绘 Paint 风格切换不生效）。
+     *   6. 现在：22% 深色（#38181B22）+ 6px 黑晕。
+     *      22% 足够把白字底下那层"黑字轮廓"压淡，又几乎不遮挡题面 ——
+     *      截图验证：能同时读清答案和底下 A/B/C/D 四个选项。
+     *
+     * 这个值不能随便调：<15% 白字开始和题面叠印，>35% 题面明显变暗。
      */
     private void paintCard() {
         boolean empty = answerView == null || answerView.getText().length() == 0
                 || answerView.getText().toString().startsWith("等待读题");
         GradientDrawable g = new GradientDrawable();
+        // 22% 深色：够压住底下的黑字，又不遮挡题面
+        g.setColor(Color.parseColor("#38181B22"));
         if (empty) {
-            // 空态：不透明深色 + 亮蓝边，任何背景上都一眼可见
-            g.setColor(Color.parseColor("#FF181B22"));
+            // 空态：只留蓝边，表示"在工作但还没读到"
             g.setStroke(dp(2), Color.parseColor("#FF4FC3F7"));
         } else {
-            // 有答案：完全不透明。
-            // 90% 也不行 —— 真机截图（2026-11-25）里页面题干「食堂排队过程中…」
-            // 会透过背板与状态行「a11y 已连接」叠印成一行，读起来像乱码。
-            // 浮层职责是让答案清晰可读，遮挡页面是必然代价。
-            g.setColor(Color.parseColor("#FF121419"));
+            // 有答案：灰边定出卡片范围
             g.setStroke(dp(2), Color.parseColor("#FF7A8899"));
         }
         g.setCornerRadius(dp(14));

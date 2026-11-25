@@ -154,6 +154,34 @@ async function engineQoder(q) {
 }
 
 /**
+ * 快档引擎：牺牲思考深度换响应速度（Vol+ ×2 触发）。
+ *
+ * 真机实测（同一道第 7 题，2026-11-25）：
+ *   dfmodel        默认 2255ms  / minimal 2554ms / off → HTTP 400
+ *   gmodel_latest  默认 3072ms  / minimal → HTTP 400
+ *   mmodel         默认 1461ms  / minimal 1434ms / off → HTTP 400
+ *   kmodel_latest  默认 9484ms  / minimal 4448ms / off 6175ms
+ *
+ * 所以「无思考」在 Qoder 网关上是伪命题：真正快的三个模型本来就不思考，
+ * 给它们 reasoning_effort 只会换来 HTTP 400（只有 kmodel_latest 认 off，
+ * 而它默认就要 9.5s，关掉思考仍比 mmodel 慢 4 倍）。
+ *
+ * 结论：快档 = 换 mmodel + minimal，不是加 off。
+ * mmodel 1.4s vs dfmodel 2.3s，实测这道题两者都答对（B）。
+ * 仍然显式传 reasoningEffort:'minimal' 而不是省略 —— 省略是「上游默认」，
+ * 上游默认随时可能变成思考模式，写死 minimal 才是可复现的快。
+ *
+ * 如果哪天网关开始支持 off，改 QODER_FAST_EFFORT=off 即可，不用动代码。
+ */
+async function engineQoderFast(q) {
+  return qoderChat(buildMessages(q), {
+    model: process.env.QODER_FAST_MODEL || 'mmodel',
+    reasoningEffort: process.env.QODER_FAST_EFFORT || 'minimal',
+    timeoutMs: Number(process.env.ANSWER_FAST_TIMEOUT_MS || 20000),
+  });
+}
+
+/**
  * qoder 视觉引擎：把原图直接交给模型看，跳过 OCR。
  *
  * 为什么需要它：RapidOCR 只能抄出文字。遇到几何图（坐标系/电路图/几何证明）、
@@ -512,6 +540,9 @@ async function ocrImage(image) {
  *
  * @returns {Promise<{text:string, boxes:Array}>} 失败时 {text:'', boxes:[]}
  */
+/**
+ * @param {string} image base64 / data URI / http URL
+ */
 async function ocrImageEx(image) {
   const base64 = await imageToBase64(image);
   if (!base64) return { text: '', boxes: [] };
@@ -577,8 +608,9 @@ function cleanOcrText(ocrText) {
  * @param {string} imageForVision 原图（base64/data URI/http URL），供视觉模型兜底
  * @param {Array} ocrBoxes OCR 的坐标框（可为空）。有坐标时 parseScreen 会用它
  *   做几何恢复：把「标签被 OCR 漏识别」的选项补回来（见 recoverOptionsByGeometry）
+ * @param {boolean} fast 快档（Vol+ ×2）：换快模型 + 浅思考，牺牲推理换速度
  */
-async function solve(text, preStructured, ocrText = '', force = false, imageForVision = '', ocrBoxes = null) {
+async function solve(text, preStructured, ocrText = '', force = false, imageForVision = '', ocrBoxes = null, fast = false) {
   // 手机端 a11y 区域抽取优先；没有或解析失败才退回整屏文本解析
   let structured;
   const structStem = String(preStructured?.stem || '').trim();
@@ -759,6 +791,10 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
     if (useVision) {
       console.log(`[vision] 走视觉模型 model=${process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel'}`);
       raw = await callEngine(() => engineQoderVision(q, imageForVision), 'vision');
+    } else if (fast && engineMode === 'qoder') {
+      console.log(`[fast] 快档 model=${process.env.QODER_FAST_MODEL || 'mmodel'}`
+        + ` effort=${process.env.QODER_FAST_EFFORT || 'minimal'}`);
+      raw = await callEngine(() => engineQoderFast(q), 'fast');
     } else {
       raw = await callEngine(() => engine(q), engineMode);
     }
@@ -768,6 +804,16 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
     if (useVision) {
       try {
         console.log('[vision] 失败，退回文本引擎');
+        raw = await callEngine(() => engine(q), engineMode);
+      } catch (e2) {
+        console.error(`[engine] ${engineMode} 也失败: ${e2.message}`);
+        return { answer: '引擎错误: ' + e.message, source: 'error', question: q, structured };
+      }
+    } else if (fast) {
+      // 快档失败不能直接报错 —— 快档是"想更快"，不该比正常档更容易失败。
+      // 退回默认档：慢一点但能出答案，比让用户看到「引擎错误」好。
+      try {
+        console.log('[fast] 快档失败，退回默认引擎');
         raw = await callEngine(() => engine(q), engineMode);
       } catch (e2) {
         console.error(`[engine] ${engineMode} 也失败: ${e2.message}`);
@@ -1052,6 +1098,7 @@ const server = http.createServer(async (req, res) => {
       let image = '';
       let structured = null;
       let force = false;
+      let fast = false;
       try {
         const j = JSON.parse(body);
         text = j.question || '';
@@ -1061,6 +1108,9 @@ const server = http.createServer(async (req, res) => {
         // 跳过「这屏是不是答题页」的闸门。非学习通场景没有 交卷/下一题 文案，
         // 不跳过就永远返回 source=none。
         force = j.force === true;
+        // 快档（手机端 Vol+ ×2）：换快模型 + 浅思考。
+        // 只在 qoder 通道生效；heuristic/openai/echo 没有思考这个概念，忽略。
+        fast = j.fast === true;
       } catch { text = body; }
       const t0 = Date.now();
       // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
@@ -1073,10 +1123,10 @@ const server = http.createServer(async (req, res) => {
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
       // 原图同时留给视觉模型：OCR 读不出题干时直接让模型看图
-      const r = await solve(text, structured, ocrText, force, image || '', ocrBoxes);
+      const r = await solve(text, structured, ocrText, force, image || '', ocrBoxes, fast);
       const from = req.socket.remoteAddress || '-';
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`
-        + ` force=${force} from=${from}`);
+        + ` force=${force} fast=${fast} from=${from}`);
       // 顺手推一条到推送队列：手机端如果用浏览器看着推送页，能看到同一份答案。
       // 不推 source=none 的空结果（那是「这屏不是答题页」，没信息量）。
       if (r.source !== 'none') {

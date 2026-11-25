@@ -20,11 +20,12 @@ import android.util.Log;
  *   "overlay" → 切浮层显隐（Vol- ×2）
  *   "app"     → 切总开关（Vol- ×3）
  *   "scan"    → 主动识别当前屏一次（Vol- 长按 2s），不改变任何开关状态
+ *   "fast"    → 快速识别（Vol+ ×2）：同 scan，但要求服务端走浅思考档
  */
 public class ToggleReceiver extends BroadcastReceiver {
     private static final String TAG = "AnsToggle";
     public static final String ACTION = "com.air.mpprobe.TOGGLE";
-    public static final String EXTRA_WHICH = "which";   // "overlay" | "app" | "scan"
+    public static final String EXTRA_WHICH = "which";   // "overlay" | "app" | "scan" | "fast"
     public static final String SECRET = "cx-helper-2026-toggle";
 
     @Override public void onReceive(Context c, Intent i) {
@@ -48,7 +49,13 @@ public class ToggleReceiver extends BroadcastReceiver {
             // 主动识别：一次性读当前屏，不启动轮询、不改任何开关。
             // 这是「非学习通场景」的唯一入口 —— 用户按一下才读，程序不自己猜。
             Log.d(TAG, "broadcast manual scan");
-            ReaderService.forceScanNow();
+            ReaderService.forceScanNow(false);
+        } else if ("fast".equals(which)) {
+            // 快速识别：与 scan 同样只读一次，但标记 fast 让服务端用浅思考档。
+            // 为什么单独一条：思考深度是"这一次请求"的属性，不是全局配置 ——
+            // 用户可能这道题想快、下道题想稳，做成全局开关就得来回切配置页。
+            Log.d(TAG, "broadcast fast scan");
+            ReaderService.forceScanNow(true);
         }
     }
 }

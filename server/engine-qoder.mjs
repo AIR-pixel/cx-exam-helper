@@ -126,7 +126,6 @@ export async function qoderChat(messages, opts = {}) {
   const client = await getClient(region);
   const modelKey = opts.model || process.env.QODER_MODEL || 'dfmodel';
   const timeoutMs = opts.timeoutMs ?? 90_000;
-
   const hasImages = Array.isArray(opts.images) && opts.images.length > 0;
   const isVl = opts.isVl ?? hasImages;
   const payload = attachImages(messages, opts.images);
@@ -159,6 +158,12 @@ export async function qoderChat(messages, opts = {}) {
       userType: opts.userType || 'personal_standard',
       isVl,
       isReasoning: opts.isReasoning === true,
+      // 无思考档：上游用 reasoning_effort 控制思考深度，"off" 表示不思考。
+      // 为什么需要它：答题场景只要求「看题 → 选字母」，推理链是纯浪费 ——
+      // 真机实测第 7 题走默认思考 13.4s，用户等不起（考试场景每题都这么久
+      // 根本没法用）。选择题的正确率也不靠长推理，靠的是见过这个知识点。
+      // 只有调用方显式给值才传：不传则沿用上游默认，避免影响别的调用路径。
+      ...(opts.reasoningEffort === undefined ? {} : { reasoningEffort: opts.reasoningEffort }),
       onDelta(delta) {
         if (typeof delta === 'string') { buf += delta; return; }
         if (delta && typeof delta.content === 'string') buf += delta.content;

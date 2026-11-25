@@ -144,15 +144,22 @@ public class ReaderService extends AccessibilityService {
      *   · 强制带上 force 标记，让服务端也跳过闸门
      */
     public static void forceScanNow() {
+        forceScanNow(false);
+    }
+
+    /**
+     * @param fast true = 快速识别（Vol+ ×2），要求服务端用浅思考档
+     */
+    public static void forceScanNow(boolean fast) {
         ReaderService s = sInstance;
         if (s == null) {
             android.util.Log.w("ReaderService", "forceScan: service not connected");
             return;
         }
-        s.doForceScan();
+        s.doForceScan(fast);
     }
 
-    private void doForceScan() {
+    private void doForceScan(boolean fast) {
         // 用户主动按的，不受冷却限制，但也要避开正在飞的请求
         if (inFlight && System.currentTimeMillis() - inFlightSince < IN_FLIGHT_TIMEOUT_MS) {
             Bus.publishStatus("正在作答中，请稍候…", "busy");
@@ -160,7 +167,8 @@ public class ReaderService extends AccessibilityService {
         }
         inFlight = false; inFlightSince = 0;          // 超时或残留状态，强制放行
         forceNext = true;
-        Bus.publishStatus("正在识别当前页面…", "busy");
+        fastNext = fast;
+        Bus.publishStatus(fast ? "快速识别中…" : "正在识别当前页面…", "busy");
         // 走和自动扫描同一条链路，只是带上 force 标记
         scanGen++;
         if (pending != null) { h.removeCallbacks(pending); pending = null; }
@@ -182,6 +190,16 @@ public class ReaderService extends AccessibilityService {
     private volatile boolean forceNext = false;
 
     /**
+     * 下一次上送是否走快速档（浅思考）。用完即清。
+     *
+     * 为什么是一次性标志而不是全局开关：
+     *   思考深度是「这一次请求」的属性。做成全局开关的话，用户想快一次就得
+     *   进配置页打开、答完再关掉 —— 考试途中来回切页面，体验比慢更糟。
+     *   一次性标志跟着手势走：Vol+ ×2 这一下快，下次正常按 Vol- 就恢复默认。
+     */
+    private volatile boolean fastNext = false;
+
+    /**
      * 强制标记的线程级传递。
      *
      * handleText / handleWithImageUrl / handleWithOcr 各自在新线程里调 askPC，
@@ -190,6 +208,15 @@ public class ReaderService extends AccessibilityService {
      * ThreadLocal 只影响当前请求线程，天然隔离。
      */
     private static final ThreadLocal<Boolean> FORCE_TLS = new ThreadLocal<Boolean>();
+
+    /**
+     * 本次上送是否要求服务端走快速档（浅思考）。
+     *
+     * 和 FORCE_TLS 一样用 ThreadLocal：handleText / handleWithOcr 各在自己线程里
+     * 调 askPC，成员变量会被并发的自动扫描串味 —— 用户按 Vol+×2 想快一次，
+     * 结果把正在跑的自动扫描也改成了快档。
+     */
+    private static final ThreadLocal<Boolean> FAST_TLS = new ThreadLocal<Boolean>();
 
     /**
      * 配置页用：真正注销无障碍服务。
@@ -456,23 +483,26 @@ public class ReaderService extends AccessibilityService {
         // 策略：有文字就送（让模型自己判断），没文字就走 OCR 兜底。
         if (forceNext) {
             forceNext = false;
+            final boolean fast = fastNext;
+            fastNext = false;
             Log.d(TAG, "FORCE scan: chars=" + text.length()
+                    + " fast=" + fast
                     + " isExamPage=" + isExamPage(text)
                     + " looksLikeQ=" + looksLikeQuestion(text));
             if (text.trim().length() >= MIN_TEXT_LEN) {
                 // 有可见文字：直接送。图片题也在这里分流（有选项无题干 → OCR）
                 if (isImageQuestion()) {
                     String imgUrl = firstImageUrl();
-                    if (!imgUrl.isEmpty()) { handleWithImageUrl(text, imgUrl, true); return; }
-                    handleWithOcr(text, true);
+                    if (!imgUrl.isEmpty()) { handleWithImageUrl(text, imgUrl, true, fast); return; }
+                    handleWithOcr(text, true, fast);
                     return;
                 }
-                handleText(text, true);
+                handleText(text, true, fast);
                 return;
             }
             // 文字太少（纯图片页 / Canvas 自绘）：只能截屏 OCR
             Log.d(TAG, "FORCE scan: too little text, go OCR");
-            handleWithOcr(text, true);
+            handleWithOcr(text, true, fast);
             return;
         }
 
@@ -504,7 +534,7 @@ public class ReaderService extends AccessibilityService {
             // 但必须先过页面闸门：登录页/首页/toast 也会走到这里，
             // 不过闸就会把整屏截图上送模型，烧额度还糊一屏废话。
             if (ToggleStore.appOn() && isExamPage(text)) {
-                handleWithOcr(text, false);
+                handleWithOcr(text, false, false);
             } else {
                 Log.d(TAG, "OCR fallback skipped: not an exam page");
                 Bus.publishStatus("未识别到题目（当前不是答题页）", "off");
@@ -519,7 +549,7 @@ public class ReaderService extends AccessibilityService {
             String imgUrl = firstImageUrl();
             if (!imgUrl.isEmpty()) {
                 Log.d(TAG, "image url found: " + (imgUrl.length() > 80 ? imgUrl.substring(0, 80) + "…" : imgUrl));
-                handleWithImageUrl(text, imgUrl, false);
+                handleWithImageUrl(text, imgUrl, false, false);
                 return;
             }
             Log.d(TAG, "no image url in a11y tree, fallback to screenshot OCR");
@@ -532,10 +562,10 @@ public class ReaderService extends AccessibilityService {
                     Log.w(TAG, "tree dump failed: " + t);
                 }
             }
-            handleWithOcr(text, false);
+            handleWithOcr(text, false, false);
             return;
         }
-        handleText(text, false);
+        handleText(text, false, false);
     }
 
     /**
@@ -745,7 +775,8 @@ public class ReaderService extends AccessibilityService {
      *   · data: URI 直接把原图交给服务端解码；http(s) 交给服务端下载
      *   · 服务端走同一条 imageStem 分支，OCR/解码结果接管题干
      */
-    private void handleWithImageUrl(final String a11yText, final String url, final boolean force) {
+    private void handleWithImageUrl(final String a11yText, final String url, final boolean force,
+                                    final boolean fast) {
         if (inFlight) { deferredScan = true; return; }
         // 发送前就去重：同一张图（URL 相同）已经答过就别再发请求。
         // 不这么做的话，轮询每 2.5s 一跳都会把同一张图重发一遍，
@@ -771,6 +802,7 @@ public class ReaderService extends AccessibilityService {
         new Thread(new Runnable() { public void run() {
             try {
                 FORCE_TLS.set(force);
+                FAST_TLS.set(fast);
                 String struct = readStructured();
                 // 直接把 URL 当 image 字段上送；服务端能识别 data:/http 前缀
                 Answer a = askPC(a11yText == null ? "" : a11yText, url,
@@ -803,7 +835,7 @@ public class ReaderService extends AccessibilityService {
         } }, "imgurl").start();
     }
 
-    private void handleWithOcr(final String a11yText, final boolean force) {
+    private void handleWithOcr(final String a11yText, final boolean force, final boolean fast) {
         if (inFlight) return;
         // 同一屏不重复截屏 OCR。
         // 轮询每 2.5s 一跳，若每次都 hide→screencap→show，叠层会不停闪，
@@ -825,6 +857,7 @@ public class ReaderService extends AccessibilityService {
         new Thread(new Runnable() { public void run() {
             try {
                 FORCE_TLS.set(force);
+                FAST_TLS.set(fast);
                 // 截屏前必须先把叠层藏起来。
                 // screencap 是像素级抓取，会把 TYPE_ACCESSIBILITY_OVERLAY 窗口
                 // 一起拍进去 —— 上一题的答案卡片正好盖在题干上，OCR 读到的
@@ -924,7 +957,7 @@ public class ReaderService extends AccessibilityService {
         }
     }
 
-    private void handleText(final String text, final boolean force) {
+    private void handleText(final String text, final boolean force, final boolean fast) {
         final String q = text;
         final String structured = readStructured();
         Log.d(TAG, "READ " + text.length() + " chars:\n"
@@ -933,6 +966,7 @@ public class ReaderService extends AccessibilityService {
         new Thread(new Runnable() { public void run() {
             try {
                 FORCE_TLS.set(force);
+                FAST_TLS.set(fast);
                 Answer a = askPC(q, null, structured);
                 if (a == null) return;
                 // 服务端判定为非题目（题干清洗后只剩页面装饰）：不糊叠层、不占去重位
@@ -1015,6 +1049,8 @@ public class ReaderService extends AccessibilityService {
             // 用 ThreadLocal 而不是成员变量：handleText/handleWithOcr 各在自己线程里
             // 调 askPC，成员变量会被并发的自动扫描串味。
             if (Boolean.TRUE.equals(FORCE_TLS.get())) body.put("force", true);
+            // 快速档：服务端据此选浅思考/无思考模型，牺牲一点推理换响应速度
+            if (Boolean.TRUE.equals(FAST_TLS.get())) body.put("fast", true);
             if (structured != null && !structured.isEmpty()) {
                 // 区域抽取结果：JSON 对象字符串，PC 端优先用它（不再猜题干/选项）
                 try { body.put("structured", new JSONObject(structured)); }
