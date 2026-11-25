@@ -74,6 +74,18 @@ public class ReaderService extends AccessibilityService {
     private Runnable pending;
     private String lastScreenHash = "";
     private volatile boolean inFlight = false;
+    /**
+     * inFlight 的起始时刻，用于超时自愈。
+     *
+     * 为什么必须有：inFlight 在各 handle* 的 finally 里复位，但 finally 只保证
+     * 在「正常返回或抛 Exception」时执行 —— Error（OOM / StackOverflow）会让
+     * 整个线程直接死掉，finally 不执行，inFlight 永久为 true。
+     * 一旦卡住，之后所有 scan/attempt/handle* 全部在入口 return，**永久静默**，
+     * 用户只能杀进程。加一个时间戳，超时后强制复位。
+     */
+    private volatile long inFlightSince = 0;
+    /** inFlight 超时上限：OCR + 模型最慢实测约 30s，给到 90s 足够宽松 */
+    private static final long IN_FLIGHT_TIMEOUT_MS = 90000;
     /** 上一次打日志时的整屏文本，用来压掉滚动/倒计时造成的重复日志 */
     private String lastLoggedText = "";
     /** 扫描链代次：每次 scheduleScan 递增，旧链的下一跳发现代数变了就退出 */
@@ -85,6 +97,16 @@ public class ReaderService extends AccessibilityService {
     private Runnable pollTick;
     /** 轮询间隔：够短能跟上翻页，够长不烧电 */
     private static final long POLL_MS = 2500;
+    /**
+     * 轮询的连续「非考试页」次数。
+     *
+     * 为什么不能一读到非考试页就停：翻页瞬间 a11y 树处于过渡态，
+     * 交卷/上一题/下一题 这些按钮可能暂时消失，isExamPage() 返回 false，
+     * 原代码直接 stopPoll() 且不再重排 —— 之后再也不轮询，除非用户手动切走再切回。
+     * 给 3 次宽限（约 7.5 秒），连续 3 次都不是考试页才真停。
+     */
+    private int pollMissCount = 0;
+    private static final int POLL_MAX_MISS = 3;
     /** 上一次做 OCR 时的 a11y 文本，用于同一屏去重（避免反复 hide/show 闪屏） */
     private String lastOcrA11yText = "";
     /** 上一次成功作答的图片 URL；用于发送前拦截同一张图的重复请求 */
@@ -101,6 +123,54 @@ public class ReaderService extends AccessibilityService {
         AnswerOverlay o = sOverlay;
         if (o != null) o.hide();
     }
+
+    /**
+     * 主动识别当前屏一次（Vol- 长按 2s 触发）。
+     *
+     * 和自动扫描的区别：
+     *   · 不看 isExamPage() —— 这是「非学习通场景」的唯一入口，
+     *     别的 App 没有 交卷/下一题 这些文案，判据必然不过
+     *   · 不看 looksLikeQuestion() —— 用户已经明确说了「这一屏是题」，
+     *     程序不需要再猜。猜错会让功能在陌生 App 上完全不可用
+     *   · 不启动轮询 —— 只读这一次，松手后就结束，不会在别的界面乱识别
+     *   · 强制带上 force 标记，让服务端也跳过闸门
+     */
+    public static void forceScanNow() {
+        ReaderService s = sInstance;
+        if (s == null) {
+            android.util.Log.w("ReaderService", "forceScan: service not connected");
+            return;
+        }
+        s.doForceScan();
+    }
+
+    private void doForceScan() {
+        // 用户主动按的，不受冷却限制，但也要避开正在飞的请求
+        if (inFlight && System.currentTimeMillis() - inFlightSince < IN_FLIGHT_TIMEOUT_MS) {
+            Bus.publishStatus("正在作答中，请稍候…", "busy");
+            return;
+        }
+        inFlight = false; inFlightSince = 0;          // 超时或残留状态，强制放行
+        forceNext = true;
+        Bus.publishStatus("正在识别当前页面…", "busy");
+        // 走和自动扫描同一条链路，只是带上 force 标记
+        scanGen++;
+        if (pending != null) { h.removeCallbacks(pending); pending = null; }
+        attempt(0);
+    }
+
+    /** 下一次上送是否强制（跳过服务端闸门）。用完即清。 */
+    private volatile boolean forceNext = false;
+
+    /**
+     * 强制标记的线程级传递。
+     *
+     * handleText / handleWithImageUrl / handleWithOcr 各自在新线程里调 askPC，
+     * 而自动扫描的请求可能同时在飞。用成员变量会让两条请求互相串味
+     * （自动扫描被误标成 force，或主动识别丢了 force）。
+     * ThreadLocal 只影响当前请求线程，天然隔离。
+     */
+    private static final ThreadLocal<Boolean> FORCE_TLS = new ThreadLocal<Boolean>();
 
     /**
      * 配置页用：真正注销无障碍服务。
@@ -226,7 +296,26 @@ public class ReaderService extends AccessibilityService {
         return false;
     }
 
+    /** 上次真正启动扫描链的时刻，用于抑制高频 windowContentChanged 导致的链互相取代 */
+    private long lastScanStartAt = 0;
+    /**
+     * 两次扫描链启动的最小间隔。
+     *
+     * 为什么需要：scheduleScan 每次都 ++scanGen，正在跑的重试链下一跳发现
+     * 代数变了就自杀。如果 windowContentChanged 持续高频触发（页面里有动画、
+     * 倒计时每秒刷新），每条链都活不到 attempt#2 就被下一代取代 ——
+     * 表现为「一直读不到完整内容」，日志里 attempt#1 反复出现但没有 #2/#3。
+     * 500ms 内只允许启动一条链，多余的事件直接忽略（内容没变，重扫也没用）。
+     */
+    private static final long SCAN_MIN_INTERVAL_MS = 500;
+
     private void scheduleScan() {
+        long now = System.currentTimeMillis();
+        if (now - lastScanStartAt < SCAN_MIN_INTERVAL_MS) {
+            Log.d(TAG, "scheduleScan throttled (" + (now - lastScanStartAt) + "ms)");
+            return;
+        }
+        lastScanStartAt = now;
         if (pending != null) h.removeCallbacks(pending);
         // 作废正在跑的重试链（它内部的下一跳靠 scanGen 自杀）
         scanGen++;
@@ -235,7 +324,9 @@ public class ReaderService extends AccessibilityService {
     }
 
     private void scan() {
-        if (inFlight) {
+        if (reclaimStuckInFlight()) {
+            // 卡住的请求已被清理，继续往下走
+        } else if (inFlight) {
             // 关键：不能静默丢帧。
             // 模型响应慢（实测 qoder 3.5~5s）时 inFlight 长时间为 true，
             // 用户在这期间翻到下一题，scheduleScan 排的那一跳到这里就被 return 掉，
@@ -247,6 +338,26 @@ public class ReaderService extends AccessibilityService {
             return;
         }
         attempt(0);
+    }
+
+    /**
+     * 检测并清理「卡死的 inFlight」。
+     *
+     * @return true 表示刚刚清理了一个超时的 inFlight
+     *
+     * 场景：handle* 里的请求线程抛了 Error（OOM / StackOverflow），
+     * finally 不执行 → inFlight 永久 true → 之后所有扫描全部静默。
+     * 用户看到的现象是「翻页后浮层再也不更新」，只能杀进程恢复。
+     */
+    private boolean reclaimStuckInFlight() {
+        if (!inFlight) return false;
+        long age = System.currentTimeMillis() - inFlightSince;
+        if (age < IN_FLIGHT_TIMEOUT_MS) return false;
+        Log.w(TAG, "inFlight stuck for " + age + "ms, force reclaim");
+        inFlight = false;
+        inFlightSince = 0;
+        Bus.publishStatus("上次请求超时，已恢复", "off");
+        return true;
     }
 
     /** 请求结束后调用：如果有被推迟的扫描，补跑一次 */
@@ -271,18 +382,28 @@ public class ReaderService extends AccessibilityService {
     private void startPoll() {
         if (pollRunning) return;
         pollRunning = true;
+        pollMissCount = 0;
         pollTick = new Runnable() { public void run() {
             if (!pollRunning) return;
             if (!ToggleStore.appOn()) { stopPoll(); return; }
             // 只在最近一次读到的是答题页时才继续轮询
             String t = readAllWindows();
             if (isExamPage(t)) {
+                pollMissCount = 0;
                 Log.d(TAG, "poll tick (exam page, chars=" + t.length() + ")");
                 scan();
             } else {
-                Log.d(TAG, "poll stop: not an exam page");
-                stopPoll();
-                return;
+                // 翻页瞬间 a11y 树是过渡态，交卷/下一题 这些按钮可能暂时消失。
+                // 原代码一读到 false 就 stopPoll() 且不重排，之后再也不轮询 ——
+                // 用户必须手动切走再切回才能恢复。给几次宽限再停。
+                pollMissCount++;
+                Log.d(TAG, "poll miss " + pollMissCount + "/" + POLL_MAX_MISS
+                        + " (not an exam page, chars=" + t.length() + ")");
+                if (pollMissCount >= POLL_MAX_MISS) {
+                    Log.d(TAG, "poll stop: " + POLL_MAX_MISS + " consecutive misses");
+                    stopPoll();
+                    return;
+                }
             }
             h.postDelayed(pollTick, POLL_MS);
         } };
@@ -291,6 +412,7 @@ public class ReaderService extends AccessibilityService {
 
     private void stopPoll() {
         pollRunning = false;
+        pollMissCount = 0;
         if (pollTick != null) { h.removeCallbacks(pollTick); pollTick = null; }
     }
 
@@ -317,6 +439,35 @@ public class ReaderService extends AccessibilityService {
         if (gen != scanGen) return;          // 这条链已被更新的扫描取代
         if (inFlight) { deferredScan = true; return; }
         String text = readAllWindows();
+
+        // ── 主动识别模式（Vol- 长按）───────────────────────────────
+        // 用户已经明确按了「读这一屏」，所以这里跳过所有「猜是不是题目」的闸门。
+        // 陌生 App（雨课堂/问卷星/任意题库）没有 交卷/下一题 这些文案，
+        // isExamPage 必然 false、looksLikeQuestion 也可能 false，
+        // 走正常路径会在第一道闸门就 return，功能等于不存在。
+        // 策略：有文字就送（让模型自己判断），没文字就走 OCR 兜底。
+        if (forceNext) {
+            forceNext = false;
+            Log.d(TAG, "FORCE scan: chars=" + text.length()
+                    + " isExamPage=" + isExamPage(text)
+                    + " looksLikeQ=" + looksLikeQuestion(text));
+            if (text.trim().length() >= MIN_TEXT_LEN) {
+                // 有可见文字：直接送。图片题也在这里分流（有选项无题干 → OCR）
+                if (isImageQuestion()) {
+                    String imgUrl = firstImageUrl();
+                    if (!imgUrl.isEmpty()) { handleWithImageUrl(text, imgUrl, true); return; }
+                    handleWithOcr(text, true);
+                    return;
+                }
+                handleText(text, true);
+                return;
+            }
+            // 文字太少（纯图片页 / Canvas 自绘）：只能截屏 OCR
+            Log.d(TAG, "FORCE scan: too little text, go OCR");
+            handleWithOcr(text, false);
+            return;
+        }
+
         boolean usable = looksLikeQuestion(text);
         // 图片题：页面上有选项和题型，但题干一个字都没有。
         // a11y 只能读到选项 —— 题干是张图，文字全在像素里。
@@ -345,7 +496,7 @@ public class ReaderService extends AccessibilityService {
             // 但必须先过页面闸门：登录页/首页/toast 也会走到这里，
             // 不过闸就会把整屏截图上送模型，烧额度还糊一屏废话。
             if (ToggleStore.appOn() && isExamPage(text)) {
-                handleWithOcr(text);
+                handleWithOcr(text, false);
             } else {
                 Log.d(TAG, "OCR fallback skipped: not an exam page");
                 Bus.publishStatus("未识别到题目（当前不是答题页）", "off");
@@ -360,7 +511,7 @@ public class ReaderService extends AccessibilityService {
             String imgUrl = firstImageUrl();
             if (!imgUrl.isEmpty()) {
                 Log.d(TAG, "image url found: " + (imgUrl.length() > 80 ? imgUrl.substring(0, 80) + "…" : imgUrl));
-                handleWithImageUrl(text, imgUrl);
+                handleWithImageUrl(text, imgUrl, false);
                 return;
             }
             Log.d(TAG, "no image url in a11y tree, fallback to screenshot OCR");
@@ -373,10 +524,10 @@ public class ReaderService extends AccessibilityService {
                     Log.w(TAG, "tree dump failed: " + t);
                 }
             }
-            handleWithOcr(text);
+            handleWithOcr(text, false);
             return;
         }
-        handleText(text);
+        handleText(text, false);
     }
 
     /**
@@ -586,7 +737,7 @@ public class ReaderService extends AccessibilityService {
      *   · data: URI 直接把原图交给服务端解码；http(s) 交给服务端下载
      *   · 服务端走同一条 imageStem 分支，OCR/解码结果接管题干
      */
-    private void handleWithImageUrl(final String a11yText, final String url) {
+    private void handleWithImageUrl(final String a11yText, final String url, final boolean force) {
         if (inFlight) { deferredScan = true; return; }
         // 发送前就去重：同一张图（URL 相同）已经答过就别再发请求。
         // 不这么做的话，轮询每 2.5s 一跳都会把同一张图重发一遍，
@@ -596,9 +747,10 @@ public class ReaderService extends AccessibilityService {
             if (overlay != null && ToggleStore.overlayOn() && ToggleStore.appOn()) overlay.show();
             return;
         }
-        inFlight = true;
+        inFlight = true; inFlightSince = System.currentTimeMillis();
         new Thread(new Runnable() { public void run() {
             try {
+                FORCE_TLS.set(force);
                 String struct = readStructured();
                 // 直接把 URL 当 image 字段上送；服务端能识别 data:/http 前缀
                 Answer a = askPC(a11yText == null ? "" : a11yText, url,
@@ -619,13 +771,13 @@ public class ReaderService extends AccessibilityService {
                 Log.d(TAG, "image-url answer src=" + a.source + " type=" + a.type + " => " + a.text);
                 Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
             } finally {
-                inFlight = false;
+                inFlight = false; inFlightSince = 0;
                 flushDeferredScan();
             }
         } }, "imgurl").start();
     }
 
-    private void handleWithOcr(final String a11yText) {
+    private void handleWithOcr(final String a11yText, final boolean force) {
         if (inFlight) return;
         // 同一屏不重复截屏 OCR。
         // 轮询每 2.5s 一跳，若每次都 hide→screencap→show，叠层会不停闪，
@@ -640,9 +792,10 @@ public class ReaderService extends AccessibilityService {
             return;
         }
         lastOcrA11yText = a11yText;
-        inFlight = true;
+        inFlight = true; inFlightSince = System.currentTimeMillis();
         new Thread(new Runnable() { public void run() {
             try {
+                FORCE_TLS.set(force);
                 // 截屏前必须先把叠层藏起来。
                 // screencap 是像素级抓取，会把 TYPE_ACCESSIBILITY_OVERLAY 窗口
                 // 一起拍进去 —— 上一题的答案卡片正好盖在题干上，OCR 读到的
@@ -708,7 +861,7 @@ public class ReaderService extends AccessibilityService {
                 Log.d(TAG, "OCR answer src=" + a.source + " type=" + a.type + " => " + a.text);
                 Bus.publishV2(a.stem, a.text, a.source, a.type, a.ms);
             } finally {
-                inFlight = false;
+                inFlight = false; inFlightSince = 0;
                 flushDeferredScan();   // 请求期间翻页了 → 补扫一次
             }
         } }).start();
@@ -741,14 +894,15 @@ public class ReaderService extends AccessibilityService {
         }
     }
 
-    private void handleText(final String text) {
+    private void handleText(final String text, final boolean force) {
         final String q = text;
         final String structured = readStructured();
         Log.d(TAG, "READ " + text.length() + " chars:\n"
                 + (text.length() > 1500 ? text.substring(0, 1500) + "…" : text));
-        inFlight = true;
+        inFlight = true; inFlightSince = System.currentTimeMillis();
         new Thread(new Runnable() { public void run() {
             try {
+                FORCE_TLS.set(force);
                 Answer a = askPC(q, null, structured);
                 if (a == null) return;
                 // 服务端判定为非题目（题干清洗后只剩页面装饰）：不糊叠层、不占去重位
@@ -779,7 +933,7 @@ public class ReaderService extends AccessibilityService {
                     }
                 } }, 400);
             } finally {
-                inFlight = false;
+                inFlight = false; inFlightSince = 0;
                 flushDeferredScan();   // 请求期间翻页了 → 补扫一次
             }
         } }).start();
@@ -822,6 +976,12 @@ public class ReaderService extends AccessibilityService {
             body.put("question", question);
             body.put("pkg", "com.air.mpprobe");
             if (image != null && !image.isEmpty()) body.put("image", image);
+            // 主动识别（Vol- 长按）：告诉服务端跳过「这屏是不是题目」的闸门。
+            // 陌生 App 没有 交卷/下一题 这些文案，服务端用 EXAM_CHROME 判会直接
+            // 返回 source=none，用户在非学习通场景永远拿不到答案。
+            // 用 ThreadLocal 而不是成员变量：handleText/handleWithOcr 各在自己线程里
+            // 调 askPC，成员变量会被并发的自动扫描串味。
+            if (Boolean.TRUE.equals(FORCE_TLS.get())) body.put("force", true);
             if (structured != null && !structured.isEmpty()) {
                 // 区域抽取结果：JSON 对象字符串，PC 端优先用它（不再猜题干/选项）
                 try { body.put("structured", new JSONObject(structured)); }

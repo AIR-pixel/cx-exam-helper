@@ -385,7 +385,7 @@ function cleanOcrText(ocrText) {
  * @param {object|null} preStructured 手机端区域抽取结果
  * @param {string} ocrText OCR 识别出的文字（无图题时为空串）
  */
-async function solve(text, preStructured, ocrText = '') {
+async function solve(text, preStructured, ocrText = '', force = false) {
   // 手机端 a11y 区域抽取优先；没有或解析失败才退回整屏文本解析
   let structured;
   const structStem = String(preStructured?.stem || '').trim();
@@ -425,6 +425,39 @@ async function solve(text, preStructured, ocrText = '') {
       + `opts=${structured.primary?.options?.length || 0} type=${structured.primary?.type || '-'}`);
   } else {
     structured = parseScreen(text);
+  }
+
+  if (!structured.ok) {
+    // 主动识别（force）：用户按了 Vol- 长按，明确说「读这一屏」。
+    // 这时不能因为「没有 交卷/下一题 文案」「不像标准题型」就拒答 ——
+    // 陌生 App（雨课堂/问卷星/任意题库）的判据必然不过，拒答等于功能不存在。
+    // 处理：把整屏文本当作一道题硬送模型，让模型自己判断这是什么。
+    // 走的是同一条 缓存→模型→归一化 流水线，只是把闸门拆掉。
+    const raw = String(text || '').trim();
+    if (force && raw.length >= 4) {
+      console.log(`[force] gate bypassed, send raw ${raw.length} chars to model`);
+      const opts = (preStructured?.options || []).map((s, i) => {
+        const str = String(s || '').trim();
+        const m = str.match(/^([A-J])\s*[.、．)）:：]\s*(.*)$/);
+        return m ? { key: m[1], text: m[2].trim() }
+                 : { key: String.fromCharCode(65 + i), text: str };
+      });
+      structured = {
+        ...structured,
+        ok: true,
+        examPage: true,
+        forced: true,
+        primary: {
+          stem: structStem || raw,
+          options: opts,
+          type: 'unknown',
+          typeLabel: preStructured?.typeLabel || '',
+          blanks: countBlanks(raw),
+        },
+        screenHash: structured.screenHash || '',
+        stableKey: '',
+      };
+    }
   }
 
   if (!structured.ok) {
@@ -555,11 +588,16 @@ const server = http.createServer(async (req, res) => {
       let text = '';
       let image = '';
       let structured = null;
+      let force = false;
       try {
         const j = JSON.parse(body);
         text = j.question || '';
         image = j.image || '';
         structured = j.structured || null;
+        // 主动识别（手机端 Vol- 长按 2s）：用户已明确说「读这一屏」，
+        // 跳过「这屏是不是答题页」的闸门。非学习通场景没有 交卷/下一题 文案，
+        // 不跳过就永远返回 source=none。
+        force = j.force === true;
       } catch { text = body; }
       const t0 = Date.now();
       // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
@@ -568,9 +606,10 @@ const server = http.createServer(async (req, res) => {
         ocrText = await ocrImage(image);
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
-      const r = await solve(text, structured, ocrText);
+      const r = await solve(text, structured, ocrText, force);
       const from = req.socket.remoteAddress || '-';
-      console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'} from=${from}`);
+      console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`
+        + ` force=${force} from=${from}`);
       return json(res, {
         answer: r.answer,
         source: r.source,

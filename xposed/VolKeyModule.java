@@ -33,28 +33,19 @@ public class VolKeyModule implements IXposedHookLoadPackage {
     private static final String ACTION = "com.air.mpprobe.TOGGLE";
     private static final String SECRET = "cx-helper-2026-toggle";
 
-    private static final long DOUBLE_MS = 500;
+    /** 触发后静默，防连发 */
     private static final long COOLDOWN_MS = 600;
-
-    /**
-     * 去重窗口：同一物理按键会先后经过 interceptKeyBeforeQueueing 和
-     * interceptKeyBeforeDispatching 两个 hook，一次按下被 onKey() 处理两次。
-     *
-     * 后果（实测 2026-11-25）：第 1 次进 onKey 时 lastUp 还是 0，now-0 是个极大值
-     * → isDouble=false，但 lastUp 已被写成 now；第 2 次进来 now-lastUp≈0
-     * → isDouble=true，于是**每次单击都被判成双击**。
-     *
-     * 用「同一 keyCode + 同一 action + 极短间隔」判定为同一次物理按键，只处理第一次。
-     * 30ms 足够覆盖两个 hook 之间的调用间隔（实测 <5ms），又远小于人手连按的
-     * 最短间隔（约 100ms），不会误合并两次真实按键。
-     */
-    private static final long DEDUP_MS = 30;
+    /** 短按派发窗口：最后一次松手后等这么久才判定单击/双击/三击 */
+    private static final long TAP_WINDOW_MS = 500;
+    /** 双击窗口（Vol+ 专用，Vol- 用 TAP_WINDOW_MS 计数器） */
+    private static final long DOUBLE_MS = 500;
+    /** 长按阈值：按住超过这个时长（且未松手）即触发主动识别 */
+    private static final long LONG_PRESS_MS = 2000;
 
     private static long lastUp = 0;
-    private static long lastDown = 0;
-    /** 冷却按 keyCode 分开：原来共享一个 lastFire，导致 Vol+ 会吃掉紧接的 Vol- */
-    private static long lastFireUp = 0;
+    /** Vol- 触发冷却（与 Vol+ 的 lastFireUp 互不干扰） */
     private static long lastFireDown = 0;
+    private static long lastFireUp = 0;
     /**
      * 同一次物理按键的标识：KeyEvent.getDownTime()。
      *
@@ -64,6 +55,61 @@ public class VolKeyModule implements IXposedHookLoadPackage {
      * downTime 是事件自带的，同一次按下必然相同，是唯一可靠标识。
      */
     private static long lastDownTime = 0;
+    /** UP 事件的 downTime 去重（与 lastDownTime 分开，两者 downTime 相同但 action 不同） */
+    private static long lastUpDownTime = 0;
+
+    // ───────────────────── 长按状态（Vol- 专用） ─────────────────────
+
+    /** 当前 Vol- 是否处于「按住中」 */
+    private static boolean volDownHeld = false;
+    /** 本次按住是否已经触发过长按（触发后松手不再算单击） */
+    private static boolean volDownLongFired = false;
+    /** 长按定时器代号：每次按下 ++，旧定时器醒来发现代号变了就退出 */
+    private static int volDownHoldGen = 0;
+    /** 按下瞬间的音量，用于长按触发后回滚 */
+    private static int volDownSavedVolume = -1;
+
+    /**
+     * 长按/三击的定时器 Handler，懒初始化。
+     *
+     * 为什么不能写成 static final 直接 new：
+     *   实测 LSPosed 在 <clinit> 阶段抛异常 → "Failed to load class
+     *   com.air.skipmodule.VolKeyModule at VolKeyModule.<clinit>(VolKeyModule.java:72)"
+     *   → 整个模块加载失败，音量键完全不工作。
+     *   <clinit> 里做系统服务调用风险太高（Looper 可能未就绪、classloader 差异）。
+     *   改成首次用时才创建，异常也被 try 吞掉，不会连累类加载。
+     */
+    private static android.os.Handler H;
+
+    private static android.os.Handler handler() {
+        android.os.Handler h = H;
+        if (h != null) return h;
+        synchronized (VolKeyModule.class) {
+            if (H == null) {
+                try {
+                    H = new android.os.Handler(android.os.Looper.getMainLooper());
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + " handler init err: " + t);
+                    return null;
+                }
+            }
+            return H;
+        }
+    }
+
+    private static void postDelayed(Runnable r, long ms) {
+        android.os.Handler h = handler();
+        if (h == null) return;
+        try { h.postDelayed(r, ms); } catch (Throwable t) {
+            XposedBridge.log(TAG + " postDelayed err: " + t);
+        }
+    }
+
+    private static void removeCallbacks(Runnable r) {
+        android.os.Handler h = handler();
+        if (h == null) return;
+        try { h.removeCallbacks(r); } catch (Throwable ignored) {}
+    }
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
@@ -120,43 +166,220 @@ public class VolKeyModule implements IXposedHookLoadPackage {
     private static void onKey(KeyEvent e, String hookName) {
         int code = e.getKeyCode();
         if (code != KeyEvent.KEYCODE_VOLUME_UP && code != KeyEvent.KEYCODE_VOLUME_DOWN) return;
-        if (e.getAction() != KeyEvent.ACTION_DOWN) return;
-        // 长按 repeat 不触发
-        try {
-            if (e.getRepeatCount() > 0) return;
-        } catch (Throwable ignored) {}
 
-        long now = System.currentTimeMillis();
+        int action = e.getAction();
         long downTime = e.getDownTime();
 
         // ① 用 downTime 去重 —— 同一次物理按键的可靠标识。
         //    实测：同一次按下会先后经过 interceptKeyBeforeQueueing 和
         //    interceptKeyBeforeDispatching，两者相隔约 140ms 且在不同线程，
-        //    靠时间窗口去重（30ms）完全挡不住，只能靠事件自带的 downTime。
-        if (downTime == lastDownTime) return;
-        lastDownTime = downTime;
-
-        // ② 冷却按 keyCode 分开，避免 Vol+ 触发后把紧接着的 Vol- 吃掉。
-        //    原来 lastFire 是共享的，实测按 Vol+ 后 300ms 内按 Vol- 完全无反应。
-        long lastFireThisKey = code == KeyEvent.KEYCODE_VOLUME_UP ? lastFireUp : lastFireDown;
-        if (now - lastFireThisKey < COOLDOWN_MS) return;
-
-        boolean isDouble;
-        if (code == KeyEvent.KEYCODE_VOLUME_UP) {
-            isDouble = now - lastUp <= DOUBLE_MS;
-            lastUp = now;
-        } else {
-            isDouble = now - lastDown <= DOUBLE_MS;
-            lastDown = now;
+        //    靠时间窗口去重完全挡不住，只能靠事件自带的 downTime。
+        //    注意：DOWN 和 UP 的 downTime 相同（同一次按压），所以去重只在
+        //    同 action 内生效，否则 UP 会被当成重复的 DOWN 丢掉。
+        if (action == KeyEvent.ACTION_DOWN) {
+            if (downTime == lastDownTime) return;
+            lastDownTime = downTime;
+        } else if (action == KeyEvent.ACTION_UP) {
+            // UP 也必须去重，否则一次物理松手会被两个 hook 各算一次 tap，
+            // 单击立刻变成双击（实测 tap #1 与 #2 相隔 3ms、线程不同）。
+            // DOWN 和 UP 的 downTime 相同（同一次按压），所以不能共用 lastDownTime。
+            if (downTime == lastUpDownTime) return;
+            lastUpDownTime = downTime;
         }
+
+        if (code == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            onVolDown(e, action, downTime);
+        } else {
+            onVolUp(e, action);
+        }
+    }
+
+    // ───────────────────────── Vol+ ─────────────────────────
+
+    private static void onVolUp(KeyEvent e, int action) {
+        if (action != KeyEvent.ACTION_DOWN) return;
+        try {
+            if (e.getRepeatCount() > 0) return;
+        } catch (Throwable ignored) {}
+
+        long now = System.currentTimeMillis();
+        if (now - lastFireUp < COOLDOWN_MS) return;
+
+        boolean isDouble = now - lastUp <= DOUBLE_MS;
+        lastUp = now;
         if (!isDouble) return;
 
-        if (code == KeyEvent.KEYCODE_VOLUME_UP) lastFireUp = now; else lastFireDown = now;
+        lastFireUp = now;
+        XposedBridge.log(TAG + " Vol+ x2 -> toggle overlay");
+        sendBroadcast("overlay");
+    }
 
-        String which = code == KeyEvent.KEYCODE_VOLUME_UP ? "overlay" : "app";
-        XposedBridge.log(TAG + " double " + (code == KeyEvent.KEYCODE_VOLUME_UP ? "UP" : "DOWN")
-                + " -> toggle " + which);
-        sendBroadcast(which);
+    // ───────────────────────── Vol- ─────────────────────────
+
+    /**
+     * Vol- 手势：
+     *   按住 ≥2s        → 主动识别当前页（which=scan）
+     *   单击            → 不拦截，正常调音量
+     *   双击            → 退出弹窗（which=overlay）
+     *   三击            → 总开关（which=app）
+     *
+     * 为什么要等一个窗口才派发：
+     *   按完第二下时无法知道用户还会不会按第三下。要么双击立即触发（那三击
+     *   永远不可能实现），要么等 TAP_WINDOW_MS。选后者 —— 双击晚 500ms 生效，
+     *   用户几乎感觉不到，但三击得以成立。
+     *
+     * 为什么用计数器而不是「上次时刻」：
+     *   原来靠 now-lastDown / now-lastTripleBase 两层时间差判断，状态互相污染，
+     *   实测单击会被判成双击。计数器只有一个变量，每按一下 +1，定时器醒来按
+     *   最终值派发，逻辑无歧义。
+     */
+    private static void onVolDown(KeyEvent e, int action, long downTime) {
+        long now = System.currentTimeMillis();
+
+        if (action == KeyEvent.ACTION_DOWN) {
+            int repeat = 0;
+            try { repeat = e.getRepeatCount(); } catch (Throwable ignored) {}
+
+            if (repeat == 0) {
+                // 新的按下：起长按定时器
+                volDownHeld = true;
+                volDownLongFired = false;
+                final int gen = ++volDownHoldGen;
+                // 记下当前音量，长按触发后回滚（否则按 2 秒音量会掉到静音）
+                if (volDownTapCount == 0) volDownSavedVolume = readMusicVolume();
+
+                postDelayed(new Runnable() { public void run() {
+                    if (gen != volDownHoldGen) return;      // 已被后续按下取代
+                    if (!volDownHeld) return;               // 已松手
+                    if (volDownLongFired) return;
+                    volDownLongFired = true;
+                    onLongPress();
+                } }, LONG_PRESS_MS);
+            }
+            // repeat 事件说明还按着，定时器在跑，什么都不做
+            return;
+        }
+
+        if (action != KeyEvent.ACTION_UP) return;
+
+        boolean longFired = volDownLongFired;
+        volDownHeld = false;
+        volDownHoldGen++;          // 作废还没跑的长按定时器
+
+        if (longFired) {
+            // 长按已触发，这次松手不再计入单击/双击/三击
+            volDownLongFired = false;
+            volDownTapCount = 0;
+            cancelTapDispatch();
+            return;
+        }
+
+        if (now - lastFireDown < COOLDOWN_MS) return;
+
+        // 计一次短按
+        volDownTapCount++;
+        XposedBridge.log(TAG + " Vol- tap #" + volDownTapCount);
+
+        if (volDownTapCount >= 3) {
+            // 三击：立即派发，不用再等
+            cancelTapDispatch();
+            volDownTapCount = 0;
+            lastFireDown = now;
+            XposedBridge.log(TAG + " Vol- x3 -> toggle app");
+            sendBroadcast("app");
+            return;
+        }
+
+        // 单击/双击：重排派发定时器（每多按一下就把窗口往后推）
+        cancelTapDispatch();
+        final int expected = volDownTapCount;
+        tapDispatch = new Runnable() { public void run() {
+            tapDispatch = null;
+            int n = volDownTapCount;
+            volDownTapCount = 0;
+            if (n != expected) return;          // 期间又变了，交给新的定时器
+            if (n == 1) {
+                // 单击：不拦截，系统已经调过音量了
+                return;
+            }
+            lastFireDown = System.currentTimeMillis();
+            XposedBridge.log(TAG + " Vol- x2 -> toggle overlay");
+            sendBroadcast("overlay");
+        } };
+        postDelayed(tapDispatch, TAP_WINDOW_MS);
+    }
+
+    /** Vol- 短按计数器：1=单击 2=双击 3=三击 */
+    private static int volDownTapCount = 0;
+    private static Runnable tapDispatch = null;
+
+    private static void cancelTapDispatch() {
+        if (tapDispatch != null) {
+            removeCallbacks(tapDispatch);
+            tapDispatch = null;
+        }
+    }
+
+    private static void onLongPress() {
+        XposedBridge.log(TAG + " Vol- long press -> scan current screen");
+        // 先把音量恢复，否则用户按住 2 秒音量已经掉到底
+        restoreMusicVolume();
+        vibrate();
+        sendBroadcast("scan");
+    }
+
+    // ─────────────────── 音量回滚 ───────────────────
+
+    private static int readMusicVolume() {
+        try {
+            android.content.Context ctx = getSystemContext();
+            if (ctx == null) return -1;
+            android.media.AudioManager am =
+                    (android.media.AudioManager) ctx.getSystemService(
+                            android.content.Context.AUDIO_SERVICE);
+            if (am == null) return -1;
+            return am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static void restoreMusicVolume() {
+        if (volDownSavedVolume < 0) return;
+        try {
+            android.content.Context ctx = getSystemContext();
+            if (ctx == null) return;
+            android.media.AudioManager am =
+                    (android.media.AudioManager) ctx.getSystemService(
+                            android.content.Context.AUDIO_SERVICE);
+            if (am == null) return;
+            am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                    volDownSavedVolume, 0);
+            XposedBridge.log(TAG + " volume restored to " + volDownSavedVolume);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " volume restore err: " + t);
+        }
+    }
+
+    // ─────────────────── 震动反馈 ───────────────────
+
+    private static void vibrate() {
+        try {
+            android.content.Context ctx = getSystemContext();
+            if (ctx == null) return;
+            android.os.Vibrator v =
+                    (android.os.Vibrator) ctx.getSystemService(
+                            android.content.Context.VIBRATOR_SERVICE);
+            if (v == null) return;
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                v.vibrate(android.os.VibrationEffect.createOneShot(
+                        40, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+            } else {
+                v.vibrate(40);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " vibrate err: " + t);
+        }
     }
 
     /** system_server 发广播到答案 app */

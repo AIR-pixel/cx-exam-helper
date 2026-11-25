@@ -9,7 +9,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="SKIP_SCREENSHOT on answer app + volume-key double-tap toggles (Vol+=overlay, Vol-=app)" />
+            android:value="SKIP_SCREENSHOT + 音量键手势：Vol+×2=弹窗显隐，Vol-×2=退出弹窗，Vol-×3=总开关，Vol-长按2s=主动识别当前屏" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
