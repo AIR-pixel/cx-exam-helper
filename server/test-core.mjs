@@ -6,7 +6,7 @@
 import {
   normalizeLine, isNoise, cleanLines, matchOption, detectType, countBlanks,
   parseScreen, parseStructured, normalizeForHash, extractJson, lettersToIndices, parseAnswerText,
-  stripPrefix, looksLikeQuestion,
+  stripPrefix, looksLikeQuestion, rebuildTextWithGeometry, recoverOptionsByGeometry,
 } from './answer-core.mjs';
 
 let pass = 0, fail = 0;
@@ -375,6 +375,54 @@ eq('超长文本不炸', (() => { try { parseScreen('长'.repeat(50000)); return
   // 回归：裸"计算"曾把课程名「计算机网络」判成题干
   eq('判据：课程名不误判', looksLikeQuestion({ stem: '计算机网络', options: [] }), false);
   eq('判据：数据分析不误判', looksLikeQuestion({ stem: '数据分析', options: [] }), false);
+}
+
+// ══════════════ 12. OCR 几何恢复 ══════════════
+// 真机数据（Redmi M2101K9C 1080x2400，河南普法竞赛第 5 题）：
+// C 选项的 "C." 是小字号独立元素，RapidOCR 整个漏掉，只留下缩进的正文两行。
+// 纯文本无法区分「C 的第一行」和「B 的折行」，坐标能。
+{
+  const boxes = [
+    { x: 92,  y: 361,  x2: 234, y2: 395,  text: '答题进度' },
+    { x: 117, y: 551,  x2: 210, y2: 588,  text: '单选题' },
+    { x: 269, y: 551,  x2: 810, y2: 590,  text: '食堂排队过程中，前方同学不慎将' },
+    { x: 95,  y: 611,  x2: 985, y2: 652,  text: '热汤酒出将你烫伤。关于本案侵权责任，下' },
+    { x: 96,  y: 676,  x2: 570, y2: 713,  text: '列说法正确的是？' },
+    { x: 126, y: 811,  x2: 960, y2: 845,  text: 'A．该同学应当承担全部责任，因其是直接行为人' },
+    { x: 127, y: 950,  x2: 960, y2: 980,  text: 'B．你自身存在责任，原因是排队时站得距离过近' },
+    { x: 184, y: 1084, x2: 950, y2: 1117, text: '应根据双方过错确定责任；受害人对损害发生' },
+    { x: 182, y: 1141, x2: 900, y2: 1174, text: '也有过错的，可以减轻侵权人的责任' },
+    { x: 127, y: 1277, x2: 780, y2: 1311, text: 'D.食堂应当承担全部赔偿责任' },
+    { x: 241, y: 1527, x2: 400, y2: 1575, text: '上一题' },
+    { x: 705, y: 1529, x2: 850, y2: 1574, text: '下一题' },
+  ];
+  const rawText = boxes.map((b) => b.text).join('\n');
+
+  // 恢复前：只有 2 个选项（线上就是这个状态，触发 optCount<3 拒绝作答）
+  eq('几何：不带坐标只有 2 选项', parseScreen(rawText).primary.options.length, 2);
+
+  // 恢复后：4 个选项全齐
+  const r = parseScreen(rawText, { boxes });
+  eq('几何：带坐标恢复 4 选项', r.primary.options.length, 4);
+  eq('几何：C 被补回标签', r.primary.options[2].key, 'C');
+  eq('几何：C 的折行被合并',
+    r.primary.options[2].text, '应根据双方过错确定责任;受害人对损害发生也有过错的,可以减轻侵权人的责任');
+  eq('几何：D 保留', r.primary.options[3].key, 'D');
+  eq('几何：题型仍为单选', r.primary.type, 'single');
+
+  // 误补防线：按钮缩进够但超出选项区，不能被标成 E
+  const texts = rebuildTextWithGeometry(rawText, boxes).split('\n');
+  ok('几何：按钮不被误标', !texts.some((t) => /^E[.、]/.test(t)),
+    texts.filter((t) => t.includes('上一题')).join('|'));
+
+  // 无坐标时行为不变
+  eq('几何：无坐标不重建', rebuildTextWithGeometry(rawText, null), rawText);
+  eq('几何：空数组不重建', rebuildTextWithGeometry(rawText, []), rawText);
+
+  // 只有 1 个带标签选项时不做恢复（无法推断基准与行距）
+  const one = boxes.filter((b) => /^A[.．]/.test(b.text) || b.text.includes('答题进度'));
+  const oneText = rebuildTextWithGeometry(one.map((b) => b.text).join('\n'), one);
+  ok('几何：单选项不恢复', !/^B[.、]/.test(oneText), oneText);
 }
 
 // ══════════════ 报告 ══════════════

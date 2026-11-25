@@ -42,7 +42,14 @@ def get_ocr():
 
 
 def recognize(data: bytes):
-    """bytes → (整屏文本, 行列表)"""
+    """bytes → (整屏文本, 行列表, 带坐标的行列表)
+
+    第三项是给下游做几何恢复用的。真实答题页里选项标签（如 "C."）常是
+    独立的小字号元素，OCR 经常整个漏掉，只留下缩进的正文行。仅靠文本
+    无法判断「这行是 C 选项的第一行」还是「上一选项的折行」—— 但坐标能：
+    选项正文左边界比选项标签右边界大一个固定缩进，且相邻选项的 y 间距
+    是稳定的行距。下游 answer-core 用这些约束把缺失的标签补回来。
+    """
     ocr = get_ocr()
     # RapidOCR 接受 numpy 数组 / 文件路径 / bytes 路径；用临时文件最稳
     fd, path = tempfile.mkstemp(suffix=".png")
@@ -57,6 +64,7 @@ def recognize(data: bytes):
             pass
 
     lines = []
+    boxes = []
     if res:
         # res: [[box, text, score], ...]，按 y 坐标排序（从上到下）
         items = []
@@ -67,11 +75,28 @@ def recognize(data: bytes):
                 sc = 0.0
             if sc < MIN_SCORE or not text:
                 continue
-            y = min(p[1] for p in box) if box else 0
-            items.append((y, str(text).strip()))
-        items.sort(key=lambda x: x[0])
-        lines = [t for _, t in items if t]
-    return "\n".join(lines), lines
+            xs = [p[0] for p in box] if box else [0]
+            ys = [p[1] for p in box] if box else [0]
+            items.append({
+                "y": min(ys),
+                "x": int(min(xs)),
+                "x2": int(max(xs)),
+                "y2": int(max(ys)),
+                "text": str(text).strip(),
+            })
+        items.sort(key=lambda it: it["y"])
+        for it in items:
+            if not it["text"]:
+                continue
+            lines.append(it["text"])
+            boxes.append({
+                "x": it["x"],
+                "y": int(it["y"]),
+                "x2": it["x2"],
+                "y2": int(it["y2"]),
+                "text": it["text"],
+            })
+    return "\n".join(lines), lines, boxes
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -114,8 +139,9 @@ class Handler(BaseHTTPRequestHandler):
                     data = f.read()
             else:
                 return self._send({"error": "need image or path"}, 400)
-            text, lines = recognize(data)
-            self._send({"ok": True, "text": text, "lines": lines, "count": len(lines)})
+            text, lines, boxes = recognize(data)
+            self._send({"ok": True, "text": text, "lines": lines,
+                        "boxes": boxes, "count": len(lines)})
         except Exception as e:
             self._send({"ok": False, "error": str(e)}, 500)
 

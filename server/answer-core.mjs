@@ -404,6 +404,146 @@ export function countBlanks(stem) {
 // ─────────────────────────── 整屏切题 ───────────────────────────
 
 /**
+ * 用 OCR 坐标把「标签被漏识别」的选项补回来。
+ *
+ * 为什么需要这一步（真机踩坑，2026-11-25）：
+ *   河南普法竞赛那道单选题，页面里四个选项都完整显示，但 C 的 "C."
+ *   是小字号独立元素，RapidOCR 完全没识别出来。OCR 只输出：
+ *       A．该同学应当承担全部责任…        x=126
+ *       B．你自身存在责任…               x=127
+ *       应根据双方过错确定责任；…         x=184   ← C 的正文，缩进了 57px
+ *       也有过错的，可以减轻侵权人的责任    x=182   ← C 的第二行
+ *       D.食堂应当承担全部赔偿责任         x=127
+ *   纯文本层面这行「应根据…」既可能是 C 的第一行，也可能是 B 的折行，
+ *   无法区分 → 解析出 2 个选项 → 触发 optCount<3 的 guard → 拒绝作答。
+ *
+ *   坐标能区分，靠两条约束：
+ *     1. 缩进：漏标签的正文左边界比正常选项正文明显右移（≈ 标签宽度）
+ *     2. 行距：它到上一选项的 y 间距 ≈ 相邻选项间距，而折行只有半个间距
+ *   两条同时成立才补标签，宁可漏补也不误补（误补会把折行当成新选项，
+ *   选项数虚高，比少选项更危险 —— 会让模型按错误的字母作答）。
+ *
+ * @param {Array<{x:number,y:number,x2:number,y2:number,text:string}>} boxes
+ * @returns {Array<{x:number,y:number,x2:number,y2:number,text:string}>} 补好标签的行
+ */
+export function recoverOptionsByGeometry(boxes) {
+  if (!Array.isArray(boxes) || boxes.length < 3) return boxes || [];
+
+  // 只处理「有选项标签」的行：先算出正常选项的正文左边界基准
+  const labeled = boxes.filter((b) => matchOption(b.text));
+  if (labeled.length < 2) return boxes;
+
+  // 基准左边界只能从「带标签的选项行」算 —— 不能从全屏最小值算。
+  // 题干行通常贴着左边界（实测 x=95/96），比选项正文（x=126）更靠左，
+  // 用它当基准会让所有选项正文都显得"没缩进"，恢复彻底失效。
+  // 取已标注选项 x 的最小值即可：漏标签的行一定是缩进的，不会拉低基准。
+  const baseX = Math.min(...labeled.map((b) => b.x));
+
+  // 相邻选项的典型行距：取相邻已标注行 y 差的**最小值**。
+  // 不能取中位数/平均值 —— 漏标签只会让间距变大，不会变小：
+  // 实测 A→B=139、B→D=327（C 漏了），中位数取到 327，
+  // 于是 C 的真实间距 134 被当成"折行"排除，恢复彻底失效。
+  // 取最小值 139 才是「一个选项间距」的正确估计。
+  const gaps = [];
+  for (let i = 1; i < labeled.length; i++) {
+    const d = labeled[i].y - labeled[i - 1].y;
+    if (d > 0) gaps.push(d);
+  }
+  if (gaps.length === 0) return boxes;
+  const optionGap = Math.min(...gaps);
+
+  // 缩进阈值：正文右移超过 baseX 的 8%（实测 184-126=58，126*0.08≈10，
+  // 折行/题干/按钮的悬挂缩进通常远小于这个值）
+  const indentThreshold = Math.max(24, baseX * 0.08);
+  // 行距容差：选项间距 ±25%（实测 optionGap=139，容差 35）
+  const gapTol = optionGap * 0.25;
+
+  // 选项区的 y 范围：第一个到最后一个已标注选项之间。
+  // 越界的一律不碰 —— 「上一题/下一题」按钮正好落在 D 下方一个行距处，
+  // 缩进也够（x=241），不设边界会被误标成 E（实测踩到）。
+  const yMin = Math.min(...labeled.map((b) => b.y));
+  const yMax = Math.max(...labeled.map((b) => b.y));
+
+  const out = boxes.map((b) => ({ ...b }));
+  // 逐个检查「无标签且缩进」的行，判断它是不是漏了标签的新选项
+  for (let i = 0; i < out.length; i++) {
+    const cur = out[i];
+    if (matchOption(cur.text)) continue;          // 已有标签，跳过
+    if (cur.x - baseX < indentThreshold) continue; // 没缩进 → 是折行
+    // 必须落在选项区内（含首尾各半个行距的余量）
+    if (cur.y < yMin - optionGap / 2 || cur.y > yMax + optionGap / 2) continue;
+
+    // 找它上方最近的「选项正文起点」（有标签的行，或已补标签的行）
+    let prev = null;
+    for (let k = i - 1; k >= 0; k--) {
+      if (matchOption(out[k].text)) { prev = out[k]; break; }
+    }
+    if (!prev) continue;
+
+    const gap = cur.y - prev.y;
+    // 行距必须接近「一个完整选项间距」；折行只有半个间距，会被排除
+    if (Math.abs(gap - optionGap) > gapTol) continue;
+
+    // 推断缺失的标签字母：取上一个选项的下一个字母
+    const prevKey = matchOption(prev.text).key;
+    const nextKey = String.fromCharCode(prevKey.charCodeAt(0) + 1);
+    if (nextKey > 'H') continue;
+
+    cur.text = `${nextKey}. ${cur.text}`;
+    cur.recovered = true;
+  }
+
+  // 第二遍：合并折行。
+  //
+  // 为什么必须做：选项正文折成两行时，第二行不带标签，会夹在「当前选项」
+  // 和「下一个选项」之间，把 splitQuestions 的「连续选项块」切断 ——
+  // 实测 C 补上标签后，C 的第二行「也有过错的…」把块切在 C 处，
+  // D 变成独立单行块，被 >=2 规则丢掉，选项数还是不全。
+  //
+  // 判据：无标签 + 行距明显小于一个选项间距（折行紧贴上一行）。
+  // 拼接而不是丢弃：折行是选项正文的一部分，丢了会让模型看到半句话。
+  const merged = [];
+  for (const b of out) {
+    const prev = merged[merged.length - 1];
+    // 折行只能拼到「带标签的行」上：题干、按钮、装饰行都不是选项正文，
+    // 把折行拼到它们后面会毁掉题干结构（实测题干两行被拼成一行）。
+    if (prev && matchOption(prev.text) && !matchOption(b.text)) {
+      const gap = b.y - prev.y;
+      // 折行间距约为行高（实测 57），选项间距约 139；取 60% 作分界
+      if (gap > 0 && gap < optionGap * 0.6) {
+        // 必须拼成**同一行**（不带换行符）。
+        // 用 \n 拼接等于没合并：下游 cleanLines 按行切分，折行依旧是独立
+        // 一行，仍会插在 C 和 D 之间把选项块切断（实测 D 被丢弃）。
+        // 中文折行直接相接即可，加空格反而会在句中留缝。
+        prev.text = `${prev.text}${b.text}`;
+        continue;
+      }
+    }
+    merged.push({ ...b });
+  }
+  return merged;
+}
+
+/**
+ * 只返回「补全后的整屏文本」，不返回行对象。
+ *
+ * 为什么单独包一层：parseScreen 拿到的是手机端已经拼好的 text，如果再用
+ * boxes 重建文本，两边的行集合会不一致（text 里可能有 boxes 没有的行），
+ * 造成选项重复（实测 "C. C. 应…"）。这里明确「有坐标就以坐标为唯一真源」，
+ * 让 parseScreen 直接用返回的文本，不再混用。
+ *
+ * @param {string} text 手机端/OCR 拼好的原始文本（boxes 缺失时的兜底）
+ * @param {Array} boxes OCR 坐标框
+ * @returns {string} 补全后的文本；没有可用坐标时原样返回 text
+ */
+export function rebuildTextWithGeometry(text, boxes) {
+  if (!Array.isArray(boxes) || boxes.length < 3) return text;
+  const fixed = recoverOptionsByGeometry(boxes);
+  if (!fixed.length) return text;
+  return fixed.map((b) => b.text).join('\n');
+}
+
+/**
  * 从清洗后的行里切出若干道题。
  * a11y 一屏可能只有一题（学习通考试页），也可能一页多题（作业页）。
  * 策略：以「连续选项块」为锚，题干取其前面最近的若干非装饰行。
@@ -496,7 +636,14 @@ function splitQuestions(lines, typeLabels = new Map()) {
  * @returns {{ok:boolean, mode:string, questions:Array, primary:object|null, screenHash:string, stableKey:string}}
  */
 export function parseScreen(text, opts = {}) {
-  const { lines, typeLabels } = cleanLines(text, { withTypes: true });
+  // 有 OCR 坐标时以坐标为准重建文本：补回被漏识别的选项标签、合并折行。
+  // 只走一条路径（坐标 → 文本），不和手机端传的 text 混用，
+  // 否则行集合不一致会让选项重复（实测 "C. C. 应…"）。
+  const srcText = Array.isArray(opts.boxes) && opts.boxes.length
+    ? rebuildTextWithGeometry(text, opts.boxes)
+    : text;
+
+  const { lines, typeLabels } = cleanLines(srcText, { withTypes: true });
   const questions = splitQuestions(lines, typeLabels);
   const screenHash = createHash('sha1')
     .update(lines.join('\n'))
@@ -508,7 +655,7 @@ export function parseScreen(text, opts = {}) {
 
   // 题目页判定：不是题就把 questions 清空，让上层走 source=none，
   // 不去调模型、不污染缓存、不在叠层上糊废话。
-  const examPage = EXAM_CHROME_RE.test(String(text == null ? '' : text));
+  const examPage = EXAM_CHROME_RE.test(String(srcText == null ? '' : srcText));
   const isQuestion = questions.length > 0 && looksLikeQuestion(questions[0], { examPage });
   const kept = isQuestion ? questions : [];
 

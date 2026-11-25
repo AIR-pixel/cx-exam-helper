@@ -33,16 +33,46 @@
  */
 
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
 import { parseScreen, parseStructured, parseAnswerText, countBlanks, detectType,
          isOcrUiNoise, stripLeadingUiCrumb } from './answer-core.mjs';
 import { AnswerCache } from './answer-cache.mjs';
 import { qoderAvailable, qoderChat, qoderModels } from './engine-qoder.mjs';
 
 const PORT = Number(process.env.ANSWER_PORT || 18888);
-// 监听地址：默认 127.0.0.1（USB reverse）。无线场景设 0.0.0.0 接受局域网/Tailscale 连接。
-const BIND = process.env.ANSWER_BIND || '127.0.0.1';
+
+/**
+ * 读取 config.json。
+ *
+ * 为什么必须读：manager.mjs 写 config.json 让用户选监听地址/引擎/模型，
+ * 但 answer-server 之前只认环境变量 —— config.json 里的 "bind": "0.0.0.0"
+ * 从来没生效过。真机实测（2026-11-25）：手机连 10.75.124.158:18888 直接
+ * SocketTimeoutException，因为服务只 bind 在 127.0.0.1，局域网进不来。
+ * 用户看到的现象就是「连接失败」，但配置页明明写着 0.0.0.0。
+ *
+ * 优先级：环境变量 > config.json > 默认值。环境变量优先是为了让
+ * 单测和临时调试能覆盖配置文件，不被用户设置干扰。
+ */
+function loadConfig() {
+  const path = process.env.ANSWER_CONFIG || './config.json';
+  try {
+    // 必须剥 BOM：manager.mjs 用 PowerShell 的 Set-Content 写配置，会带上
+    // UTF-8 BOM（EF BB BF），JSON.parse 遇到 BOM 直接抛 "Unexpected token"。
+    // 之前整个 try/catch 吞掉异常返回 {}，于是 config.json 里的 bind/engine
+    // 从来没生效过 —— 用户在配置页设 0.0.0.0，服务实际还是 127.0.0.1，
+    // 手机端表现为「连接失败」（2026-11-25 真机踩到）。
+    const raw = readFileSync(path, 'utf8').replace(/^\uFEFF/, '');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+const FILE_CONFIG = loadConfig();
+
+// 监听地址：默认 127.0.0.1（USB reverse）。无线场景设 0.0.0.0 接受局域网连接。
+const BIND = process.env.ANSWER_BIND || String(FILE_CONFIG.bind || '').trim() || '127.0.0.1';
 const CACHE_PATH = process.env.ANSWER_CACHE === '' ? ':memory:'
-  : (process.env.ANSWER_CACHE || './answer-cache.db');
+  : (process.env.ANSWER_CACHE || FILE_CONFIG.cachePath || './answer-cache.db');
 // 图片题 OCR：Python RapidOCR 微服务地址，空字符串 = 关闭
 const OCR_URL = process.env.OCR_URL || 'http://127.0.0.1:18890/ocr';
 
@@ -469,13 +499,27 @@ function safeFromCode(n) {
  * @returns {Promise<string>} 识别出的整屏文字；失败返回空串
  */
 async function ocrImage(image) {
+  const r = await ocrImageEx(image);
+  return r.text;
+}
+
+/**
+ * 同 ocrImage，但把 OCR 的坐标框一起带回来。
+ *
+ * 坐标不是锦上添花：真实答题页里选项标签（"C."）常是小字号独立元素，
+ * OCR 会整个漏掉，只留缩进的正文行。纯文本无法区分「这是 C 的第一行」
+ * 还是「B 的折行」—— 坐标能（见 recoverOptionsByGeometry）。
+ *
+ * @returns {Promise<{text:string, boxes:Array}>} 失败时 {text:'', boxes:[]}
+ */
+async function ocrImageEx(image) {
   const base64 = await imageToBase64(image);
-  if (!base64) return '';
+  if (!base64) return { text: '', boxes: [] };
 
   // SVG 直接抽 <text>，不用 OCR
-  if (base64.startsWith('__SVG__')) return textFromSvg(base64.slice(7));
+  if (base64.startsWith('__SVG__')) return { text: textFromSvg(base64.slice(7)), boxes: [] };
 
-  if (!OCR_URL) return '';
+  if (!OCR_URL) return { text: '', boxes: [] };
   try {
     const res = await fetch(OCR_URL, {
       method: 'POST',
@@ -486,13 +530,14 @@ async function ocrImage(image) {
     const j = await res.json();
     if (!j.ok || !j.text) {
       console.warn(`[ocr] failed: ${j.error || 'empty'}`);
-      return '';
+      return { text: '', boxes: [] };
     }
-    console.log(`[ocr] ${j.count} lines, ${j.text.length} chars`);
-    return j.text;
+    const boxes = Array.isArray(j.boxes) ? j.boxes : [];
+    console.log(`[ocr] ${j.count} lines, ${j.text.length} chars, ${boxes.length} boxes`);
+    return { text: j.text, boxes };
   } catch (e) {
     console.warn(`[ocr] unavailable: ${e.message}`);
-    return '';
+    return { text: '', boxes: [] };
   }
 }
 
@@ -530,8 +575,10 @@ function cleanOcrText(ocrText) {
  * @param {string} ocrText OCR 识别出的文字（无图题时为空串）
  * @param {boolean} force 主动识别（Vol- 长按），跳过「是不是答题页」闸门
  * @param {string} imageForVision 原图（base64/data URI/http URL），供视觉模型兜底
+ * @param {Array} ocrBoxes OCR 的坐标框（可为空）。有坐标时 parseScreen 会用它
+ *   做几何恢复：把「标签被 OCR 漏识别」的选项补回来（见 recoverOptionsByGeometry）
  */
-async function solve(text, preStructured, ocrText = '', force = false, imageForVision = '') {
+async function solve(text, preStructured, ocrText = '', force = false, imageForVision = '', ocrBoxes = null) {
   // 手机端 a11y 区域抽取优先；没有或解析失败才退回整屏文本解析
   let structured;
   const structStem = String(preStructured?.stem || '').trim();
@@ -546,7 +593,7 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
     // 用 OCR 文本重新解析，选项以手机端抽到的为准（OCR 可能把选项读错）
     const cleaned = cleanOcrText(ocrText);
     console.log(`[image-question] OCR 清洗后 ${cleaned.length} chars:\n${cleaned.slice(0, 300)}`);
-    structured = parseScreen(cleaned);
+    structured = parseScreen(cleaned, { boxes: ocrBoxes });
     if (structured.ok) {
       // 手机端传的是字符串数组 ["A. 传输层", ...]，而 renderAnswer 要的是
       // [{key:'A', text:'传输层'}, ...]。直接赋值会让 opts[i].text 取到
@@ -570,7 +617,9 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
     console.log(`[structured] stem="${String(structured.primary?.stem || '').slice(0, 40)}" `
       + `opts=${structured.primary?.options?.length || 0} type=${structured.primary?.type || '-'}`);
   } else {
-    structured = parseScreen(text);
+    // 整屏文本解析。OCR 来的文本带上坐标，让 parseScreen 先做几何恢复
+    // （补回被 OCR 漏掉的选项标签）；纯 a11y 文本没有坐标，行为不变。
+    structured = parseScreen(text, { boxes: ocrBoxes });
   }
 
   if (!structured.ok) {
@@ -1016,12 +1065,15 @@ const server = http.createServer(async (req, res) => {
       const t0 = Date.now();
       // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
       let ocrText = '';
+      let ocrBoxes = null;
       if (image) {
-        ocrText = await ocrImage(image);
+        const o = await ocrImageEx(image);
+        ocrText = o.text;
+        ocrBoxes = o.boxes;
         if (ocrText) text = text ? text + '\n' + ocrText : ocrText;
       }
       // 原图同时留给视觉模型：OCR 读不出题干时直接让模型看图
-      const r = await solve(text, structured, ocrText, force, image || '');
+      const r = await solve(text, structured, ocrText, force, image || '', ocrBoxes);
       const from = req.socket.remoteAddress || '-';
       console.log(`[answer] ${Date.now() - t0}ms source=${r.source} type=${r.question?.type || '-'}`
         + ` force=${force} from=${from}`);
@@ -1065,6 +1117,14 @@ export const __test_renderAnswer = renderAnswer;
 if (process.env.ANSWER_NO_LISTEN !== '1') {
   server.listen(PORT, BIND, () => {
     console.log(`Answer server v2.1 on ${BIND}:${PORT}`);
+    // 监听地址来源要打出来：手机连不上时第一眼就能判断是 bind 配错还是防火墙。
+    const bindSrc = process.env.ANSWER_BIND ? 'env ANSWER_BIND'
+      : (FILE_CONFIG.bind ? 'config.json' : 'default');
+    if (BIND === '127.0.0.1' || BIND === 'localhost') {
+      console.log(`  bind   = ${BIND} (${bindSrc}) —— 只接受本机连接，手机连不上属正常`);
+    } else {
+      console.log(`  bind   = ${BIND} (${bindSrc})`);
+    }
     console.log(`  engine = ${engineMode}${engineReq !== engineMode ? ` (requested ${engineReq})` : ''}`);
     console.log(`  cache  = ${cache ? cache.path : 'disabled'}`);
   });

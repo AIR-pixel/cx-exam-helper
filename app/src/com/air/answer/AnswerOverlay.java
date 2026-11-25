@@ -40,6 +40,10 @@ public final class AnswerOverlay {
     private static final float OUTLINE_R = 2.5f;
     // 窗口高度上限：短答案自动包内容（WRAP），超长答案封顶后内部自动滚动
     private static final int MAX_ANSWER_HEIGHT = 480;
+    /** 空态答案区最小高度（dp）：保证浮层挂上时是一块看得见的实体，不是一条线 */
+    private static final int EMPTY_MIN_H = 56;
+    /** 空态提示文案：自解释，用户一眼看出「在，只是还没读到题」 */
+    private static final String EMPTY_HINT = "等待读题…\n长按音量减 2 秒立即识别";
 
     // 自动滚动参数：浮层 NOT_TOUCHABLE，用户拖不了，超长答案只能自己滚
     private static final int SCROLL_TICK_MS = 16;      // ~60fps
@@ -83,7 +87,9 @@ public final class AnswerOverlay {
         try {
             card = new LinearLayout(ctx);
             card.setOrientation(LinearLayout.VERTICAL);
-            int padH = dp(12), padV = dp(8);
+            // padV 从 8 加到 14：真机截图里状态行「a11y 已连接」紧贴卡片下沿，
+            // 看起来像被切掉。上下各留 14dp 才像一张完整的卡。
+            int padH = dp(14), padV = dp(14);
             card.setPadding(padH, padV, padH, padV);
             paintCard();
 
@@ -95,10 +101,17 @@ public final class AnswerOverlay {
             metaView.setShadowLayer(OUTLINE_R, 0f, 0f, Color.BLACK);
 
             answerView = new TextView(ctx);
-            answerView.setText("等待读题…");
+            // 空态文案要自解释：用户看到它就知道「浮层在，只是还没读到题」，
+            // 而不是「这东西坏了」。配合下面的实心深色背板一起看。
+            answerView.setText(EMPTY_HINT);
             answerView.setTextColor(Color.WHITE);
             answerView.setTextSize(TypedValue.COMPLEX_UNIT_SP, ANSWER_SP);
+            answerView.setGravity(android.view.Gravity.CENTER);
             answerView.setLineSpacing(dp(2), 1f);
+            // 空态最小高度：窗口是 WRAP_CONTENT，若只有两行 10sp 小字，
+            // 整张卡会缩成一条 40px 的细线（真机实测：挂在天气组件里，
+            // 用户完全看不出这是个浮层）。给答案区一个下限，空态就有实体。
+            answerView.setMinHeight(dp(48));
             // 不再硬限行数：长简答要能整段显示出来。
             // 上界由窗口高度兜（见 relayout），超出才出现滚动。
             answerView.setMovementMethod(new ScrollingMovementMethod());
@@ -116,15 +129,32 @@ public final class AnswerOverlay {
             statusView.setShadowLayer(OUTLINE_R, 0f, 0f, Color.BLACK);
 
             card.addView(metaView);
-            card.addView(answerView, new LinearLayout.LayoutParams(
+            // 空态给一个实心高度：窗口是 WRAP_CONTENT，如果答案区只有一行文字，
+            // 整张卡就缩成一条细线（真机实测：900x40 挂在天气组件里，
+            // 用户看到的只是「弹窗已打开」那行小字，以为浮层没出来）。
+            // 显式指定高度而非 setMinHeight —— 后者在 WRAP_CONTENT 的
+            // LayoutParams 下不保证生效，实测确实没生效。
+            //
+            // 上下各留 6dp 外边距：真机截图里 meta「题库缓存·单选·3127ms」和
+            // 答案首行、答案末行和 status「a11y 已连接」都贴在一起，
+            // 三层文字糊成一块，分不清哪行是答案。
+            LinearLayout.LayoutParams ansLp = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT));
+                    dp(EMPTY_MIN_H));
+            ansLp.topMargin = dp(6);
+            ansLp.bottomMargin = dp(6);
+            card.addView(answerView, ansLp);
             card.addView(statusView);
 
             WindowManager.LayoutParams lp = buildParams(cardWidth(),
                     WindowManager.LayoutParams.WRAP_CONTENT);
             wm.addView(card, lp);
             attached = true;
+            // 挂载成功必须留痕：真机排查「弹窗不出来」时，dumpsys window 能看到
+            // 窗口但用户看不到（背板近透明），日志里却什么都没有，无从判断
+            // 是没挂上还是挂上了不可见。这条把两者分开。
+            android.util.Log.i("AnswerOverlay", "OVERLAY[attached] "
+                    + lp.width + "x" + lp.height + " y=" + lp.y + " type=" + lp.type);
             // 这里不主动回填 Bus.last()：render() 在未挂载时会调 showInner()，
             // 若 showInner 再回填就会递归。回填统一由调用方（Bus listener /
             // render 自身）负责，showInner 只负责把 View 树搭起来。
@@ -152,7 +182,9 @@ public final class AnswerOverlay {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        lp.y = 200;
+        // y=200 落在页面「答题进度 05/20」那一行上，叠层和页面文字叠印（真机截图）。
+        // 往下挪到 260，避开标题栏和进度条，仍在第一屏可见区域。
+        lp.y = 260;
         // 窗口整体不透明度：背板已近透明，这里保持满不透明度保证文字清晰
         lp.alpha = 1.0f;
         // 明确不抢焦点、不拦截触摸：学习通照常可点
@@ -177,11 +209,25 @@ public final class AnswerOverlay {
                 curType = type;
                 relayout(type);
             }
-            // 统一浅灰透明背板，不随来源变色
-            paintCard();
 
-            answerView.setText(m.answer == null || m.answer.isEmpty() ? "…" : m.answer);
-            scheduleAutoScroll(m.answer);
+            // 空答案必须保持空态（实心背板 + 固定高度 + 自解释文案）。
+            // 之前这里写 answerView.setText("…")，结果：paintCard 认为"有答案"
+            // 切成近透明背板、高度重置成 WRAP_CONTENT，整张卡塌成一条 100px
+            // 的细线（真机截图：只剩「…」和状态行浮在天气组件上）。
+            // 空答案 = 没答案可显示，就该留在空态。
+            boolean hasAnswer = m.answer != null && m.answer.trim().length() > 0
+                    && !"…".equals(m.answer.trim());
+            if (hasAnswer) {
+                answerView.setText(m.answer);
+                answerView.setGravity(android.view.Gravity.START);
+                setAnswerHeight(android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            } else {
+                answerView.setText(EMPTY_HINT);
+                answerView.setGravity(android.view.Gravity.CENTER);
+                setAnswerHeight(dp(EMPTY_MIN_H));
+            }
+            paintCard();
+            scheduleAutoScroll(hasAnswer ? m.answer : null);
 
             StringBuilder meta = new StringBuilder(labelSource(m.source));
             if (!type.isEmpty()) meta.append(" · ").append(labelType(type));
@@ -199,9 +245,24 @@ public final class AnswerOverlay {
         } });
     }
 
+    /**
+     * 改答案区高度。
+     *
+     * 为什么不能只靠 setMinHeight：窗口 LayoutParams 是 WRAP_CONTENT，
+     * 高度由内容测量决定，minHeight 在实测里没拦住塌缩（浮层变成 900x40
+     * 一条细线）。显式改 LayoutParams.height 才能保证空态有实体高度。
+     */
+    private void setAnswerHeight(int h) {
+        if (answerView == null) return;
+        android.view.ViewGroup.LayoutParams lp = answerView.getLayoutParams();
+        if (lp == null) return;
+        if (lp.height == h) return;
+        lp.height = h;
+        answerView.setLayoutParams(lp);
+    }
+
     /** 宽度按题型：简答要宽、判断可窄；高度交给内容自适应（WRAP），长答案封顶滚动 */
-    private void relayout(String type) {
-        int w = cardWidth(type);
+    private void relayout(String type) {        int w = cardWidth(type);
         try {
             wm.updateViewLayout(card, buildParams(w, WindowManager.LayoutParams.WRAP_CONTENT));
         } catch (Throwable ignored) {}
@@ -220,12 +281,38 @@ public final class AnswerOverlay {
         }
     }
 
-    /** 背板统一浅灰透明：覆盖题目时不让题面被遮住，来源不染色 */
+    /**
+     * 背板：两档不透明度，但**都必须能读清文字**。
+     *
+     * 历史（真机两次踩坑）：
+     *   1. 最初统一用 #1AE0E0E0（alpha=26/255，约 10%）。空态时整张卡只剩两行
+     *      10sp 小字浮在任意背景上，浅色桌面上完全看不出来 —— 用户以为「弹窗
+     *      没出来」，其实是出来了。于是空态改成深色实心 + 亮边。
+     *   2. 有答案后仍保留 10% 近透明，理由是「不遮题面」。但这是自相矛盾的：
+     *      答案必然覆盖题面，10% 背板下答案文字和底下的「答题进度 05/20」
+     *      直接叠印在一起（2026-11-25 真机截图，答案和进度数字糊成一团）。
+     *      浮层的唯一职责是让用户看清答案，不是透视题面。
+     *
+     * 现在：空态深色实心 + 蓝边（确认在工作）；有答案深色实心 + 灰边（能读清）。
+     * 两档都保证文字对比度，区别只在边框颜色和深浅。
+     */
     private void paintCard() {
+        boolean empty = answerView == null || answerView.getText().length() == 0
+                || answerView.getText().toString().startsWith("等待读题");
         GradientDrawable g = new GradientDrawable();
-        g.setColor(Color.parseColor("#1AE0E0E0"));
+        if (empty) {
+            // 空态：不透明深色 + 亮蓝边，任何背景上都一眼可见
+            g.setColor(Color.parseColor("#FF181B22"));
+            g.setStroke(dp(2), Color.parseColor("#FF4FC3F7"));
+        } else {
+            // 有答案：完全不透明。
+            // 90% 也不行 —— 真机截图（2026-11-25）里页面题干「食堂排队过程中…」
+            // 会透过背板与状态行「a11y 已连接」叠印成一行，读起来像乱码。
+            // 浮层职责是让答案清晰可读，遮挡页面是必然代价。
+            g.setColor(Color.parseColor("#FF121419"));
+            g.setStroke(dp(2), Color.parseColor("#FF7A8899"));
+        }
         g.setCornerRadius(dp(14));
-        g.setStroke(dp(2), Color.parseColor("#FF9E9E9E"));
         if (card != null) card.setBackground(g);
     }
 
