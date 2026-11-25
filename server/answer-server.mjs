@@ -117,7 +117,9 @@ function buildMessages(q) {
 async function engineQoder(q) {
   return qoderChat(buildMessages(q), {
     model: process.env.QODER_MODEL || 'dfmodel',
-    timeoutMs: Number(process.env.ANSWER_TIMEOUT_MS || 90000),
+    // 30s 而不是 90s：正常题 0.6-7s 就回，超过 30s 基本是网络卡死，
+    // 再等下去用户早走了。真机实测出现过 58s 才返回的情况（手机已断开）。
+    timeoutMs: Number(process.env.ANSWER_TIMEOUT_MS || 30000),
   });
 }
 
@@ -271,6 +273,17 @@ if (engineReq === 'auto' || engineReq === 'qoder') {
   engineMode = 'heuristic';
 }
 
+/**
+ * 这个引擎的回答能不能当真？
+ *
+ * heuristic 是纯占位（永远返回 index:0），echo 是回显 —— 两者都只用于验证管线。
+ * 真机上它们跑出来的答案看起来和真答案一模一样（"A GET"），用户分辨不出来，
+ * 但它跟题目毫无关系。更糟的是它会被写进缓存，从此每次命中都吐同一个错答案。
+ *
+ * 所以：占位引擎的回答不写缓存、并在浮层上标明「占位」。
+ */
+const isPlaceholderEngine = engineMode === 'heuristic' || engineMode === 'echo';
+
 // ─────────────────────────── 核心流程 ───────────────────────────
 
 /** 归一化作答参数 → 人可读 / 手机可解析的短字符串 */
@@ -289,9 +302,15 @@ function renderAnswer(ans, q) {
     try { idx = JSON.parse(p.indicesJson); } catch { /* ignore */ }
     if (!Array.isArray(idx)) idx = [];
     const optsLen = opts.length;
-    const valid = idx.filter((i) => Number.isInteger(i) && i >= 0 && (optsLen === 0 || i < optsLen));
+    // 只挡真正无意义的下标（负数/非整数/超过 Z）。
+    // 不能因为 optsLen 小就丢 —— 选项解析不全是常态（WebView 把选项拆散、
+    // 只滚动到一半、图片选项读不出），此时模型给的 3 很可能就是对的 D。
+    const valid = idx.filter((i) => Number.isInteger(i) && i >= 0 && i < 26);
     if (valid.length !== idx.length) {
-      console.error(`[render] indices 越界 ${JSON.stringify(idx)}（选项 ${optsLen} 个），已过滤`);
+      console.error(`[render] indices 含非法下标 ${JSON.stringify(idx)}，已过滤`);
+    }
+    if (optsLen && valid.some((i) => i >= optsLen)) {
+      console.error(`[render] indices ${JSON.stringify(valid)} 超出已解析选项 ${optsLen} 个，仍按字母输出`);
     }
     return valid.map((i) => {
       const L = String.fromCharCode(65 + i);
@@ -301,14 +320,24 @@ function renderAnswer(ans, q) {
   }
   if (p.selectedIndex != null) {
     const i = Number(p.selectedIndex);
-    // 越界保护：视觉模型看图数选项时可能给出超出范围的下标，
-    // String.fromCharCode(65+5) 会渲染成 "F" —— 4 个选项的题出现 F 是明显错误。
-    if (!Number.isInteger(i) || i < 0 || (opts.length > 0 && i >= opts.length)) {
-      console.error(`[render] selectedIndex=${p.selectedIndex} 越界（选项 ${opts.length} 个），丢弃`);
+    // 负数 = 模型主动表示「这些选项里没有正确答案」。这通常意味着选项没读全
+    // （WebView 把选项拆散、只滚动到一半），而不是模型胡说 —— 要告诉用户
+    // 「选项没读全，请滚动后重按」，比丢一句「格式异常」有用得多。
+    if (Number.isInteger(i) && i < 0) {
+      console.error(`[render] selectedIndex=${i} 模型认为选项不含正确答案（选项 ${opts.length} 个）`);
+      return '选项没读全，请滚动让四个选项都露出来后重按';
+    }
+    // 超过 Z 或非整数 = 真正的垃圾输出
+    if (!Number.isInteger(i) || i >= 26) {
+      console.error(`[render] selectedIndex=${p.selectedIndex} 非法，丢弃`);
       return '';
     }
     const L = String.fromCharCode(65 + i);
     const t = opts[i] ? ` ${opts[i].text}` : '';
+    if (opts.length && i >= opts.length) {
+      console.error(`[render] selectedIndex=${i} 超出已解析选项 ${opts.length} 个，只输出字母 ${L}`);
+      return `${L}（选项未读全，请核对）`;
+    }
     return `${L}${t}`;
   }
   if (Array.isArray(p.answers)) return p.answers.join(' | ');
@@ -612,6 +641,30 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
 
   const q = structured.primary;
 
+  // 选项不全时不要问模型。
+  //
+  // 真机实测（m.topnews.cn 微信 WebView）：C 选项的「C.」前缀被 WebView 拆成
+  // 独立节点或被 CSS 隐藏，4 个选项只读到 2 个。这时模型的表现是：
+  //   - 有时回 index:-1（认得出选项里没有正确答案）→ 白等 30s
+  //   - 有时硬凑一个 index:0（"A. 是在校生，不享有选举权"）→ 答错
+  //   - 耗时从正常的 1s 涨到 50s+，因为它在那反复权衡两个都不对的选项
+  // 三种结果都是浪费用户时间。唯一有用的输出是让用户把选项露全。
+  //
+  // 阈值取 3：客观题最少 2 个选项（判断题），但判断题走 judge 分支不走这里；
+  // 走 single/multi 的题至少 3 个选项才算读全。
+  const optCount = (q.options || []).length;
+  if ((q.type === 'single' || q.type === 'multi') && optCount < 3) {
+    console.error(`[guard] ${q.type} 题只有 ${optCount} 个选项，拒绝作答`);
+    return {
+      answer: optCount === 0
+        ? '没读到选项，请滚动让选项露出来后重按'
+        : `只读到 ${optCount} 个选项（应有 4 个），请滚动让选项露全后重按`,
+      source: 'none',
+      question: q,
+      structured,
+    };
+  }
+
   // 1. 缓存
   if (cache) {
     const hit = cache.get(q);
@@ -632,12 +685,33 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
   // 图片题分流：OCR 读不出题干（图形题/结构式/OCR 挂了）时，直接把原图交给视觉模型。
   // 必须放在缓存之后 —— 同一题第二次长按时命中缓存，不必再烧一次图片 token。
   const useVision = !!imageForVision && shouldUseVision(q, ocrText);
+
+  /**
+   * 调一次引擎，网络类错误重试一次。
+   *
+   * 超时**不重试** —— 30s 超时 + 重试 = 60s，用户早就走了。
+   * 只有「连接立刻失败」（ECONNREFUSED / fetch failed，毫秒级）才值得重试，
+   * 那种情况重试一次是几十毫秒的事。超时说明网络慢，重试只会更慢。
+   */
+  const callEngine = async (fn, label) => {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      if (/超时|timeout/i.test(msg)) throw e;
+      const retriable = /ECONNREFUSED|ECONNRESET|socket hang up|fetch failed|ENOTFOUND/i.test(msg);
+      if (!retriable) throw e;
+      console.error(`[engine] ${label} 第1次失败（${msg}），立刻重试`);
+      return await fn();
+    }
+  };
+
   try {
     if (useVision) {
       console.log(`[vision] 走视觉模型 model=${process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel'}`);
-      raw = await engineQoderVision(q, imageForVision);
+      raw = await callEngine(() => engineQoderVision(q, imageForVision), 'vision');
     } else {
-      raw = await engine(q);
+      raw = await callEngine(() => engine(q), engineMode);
     }
   } catch (e) {
     console.error(`[engine] ${useVision ? 'vision' : engineMode} failed: ${e.message}`);
@@ -645,7 +719,7 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
     if (useVision) {
       try {
         console.log('[vision] 失败，退回文本引擎');
-        raw = await engine(q);
+        raw = await callEngine(() => engine(q), engineMode);
       } catch (e2) {
         console.error(`[engine] ${engineMode} 也失败: ${e2.message}`);
         return { answer: '引擎错误: ' + e.message, source: 'error', question: q, structured };
@@ -677,15 +751,24 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
   // cache.put 直接跳过。否则所有选项相同的图片题会共用一个键、互相污染。
   // source 用实际出答案的通道，不能照抄 engineMode：视觉答案记成 heuristic
   // 会让 /stats 的来源分布失真。
-  if (cache && normalized.type !== 'short') {
+  //
+  // 占位引擎（heuristic/echo）的答案一律不写缓存。它们永远返回 index:0，
+  // 一旦进缓存就变成「这题的标准答案」，之后每次命中都吐同一个错答案，
+  // 而且命中数越高越像「验证过的」，越不可疑。实测踩到过：一条
+  // multi 题被 heuristic 写成 [0]，hits=43。
+  if (cache && normalized.type !== 'short' && !isPlaceholderEngine) {
     const src = useVision ? 'vision' : ((engineMode === 'openai' || engineMode === 'qoder') ? 'ai' : engineMode);
     const wrote = cache.put(q, normalized, src);
     if (!wrote) console.log('[cache] 空题干，跳过缓存写入');
+  } else if (isPlaceholderEngine) {
+    console.log('[cache] 占位引擎，跳过缓存写入');
   }
 
   const srcTag = useVision ? 'vision' : engineMode;
-  console.log(`[${srcTag}] ${q.type} q="${String(q.stem).slice(0, 40)}" raw="${raw.slice(0, 60)}" => ${rendered}`);
-  return { answer: rendered, source: srcTag, question: q, structured, normalized };
+  // 占位引擎要在浮层上明确标出来 —— 否则用户以为那是真答案。
+  const shown = isPlaceholderEngine ? `${rendered}（占位，非真实作答）` : rendered;
+  console.log(`[${srcTag}] ${q.type} q="${String(q.stem).slice(0, 40)}" raw="${raw.slice(0, 60)}" => ${shown}`);
+  return { answer: shown, source: srcTag, question: q, structured, normalized };
 }
 
 // ─────────────────────────── HTTP ───────────────────────────

@@ -45,7 +45,7 @@ const DEFAULT_CONFIG = {
   qoderModel: 'dfmodel',
   qoderPat: '',             // 留空 = 用 ~/.dsh/.qoder-accounts.cn.json
   qoderRegion: 'cn',        // cn | global
-  timeoutMs: 90000,
+  timeoutMs: 20000,
   // 图片题视觉兜底：OCR 读不出题干时把原图直接交给视觉模型
   vision: true,             // false = 只走 OCR，不调视觉模型
   vlModel: '',              // 留空 = 用 qoderModel；实测 dfmodel/gmodel_latest/mmodel 都支持看图

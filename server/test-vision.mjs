@@ -148,12 +148,17 @@ t('stem 短但 ocrText 长 → 取较大者，不走视觉', () => {
   assert.equal(shouldUseVision({ stem: 'AB' }, ocr), false);
 });
 
-console.log('\n=== 8. 回归：选项越界索引（review 修复）===');
+console.log('\n=== 8. 选项索引渲染（真机实测后修正语义）===');
 const renderAnswer = mod.__test_renderAnswer;
 const q4 = {
   type: 'single',
   stem: '题干',
   options: [{ text: '传输层' }, { text: '网络层' }, { text: '数据链路层' }, { text: '物理层' }],
+};
+const q2 = {
+  type: 'single',
+  stem: '题干',
+  options: [{ text: '是在校生，不享有选举权' }, { text: '未满22周岁，不享有选举权' }],
 };
 t('index=0 → A 传输层', () => {
   assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 0 } }, q4), 'A 传输层');
@@ -161,24 +166,45 @@ t('index=0 → A 传输层', () => {
 t('index=3 → D 物理层', () => {
   assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 3 } }, q4), 'D 物理层');
 });
-t('index=5 越界 → 空串（不渲染成 F）', () => {
-  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 5 } }, q4), '');
+t('index=5 超出 4 个选项 → 保留字母并提示核对（不能丢弃）', () => {
+  // 真机教训：选项解析不全是常态（WebView 拆散选项、只滚动到一半）。
+  // 此时模型给的 D 很可能就是对的，丢掉比给错更糟 —— 给字母 + 提示用户核对。
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 5 } }, q4), 'F（选项未读全，请核对）');
 });
-t('index=-1 → 空串', () => {
-  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: -1 } }, q4), '');
+t('index=-1 模型认为选项里没有正确答案 → 提示滚动', () => {
+  assert.equal(
+    renderAnswer({ mode: 'json', params: { selectedIndex: -1 } }, q4),
+    '选项没读全，请滚动让四个选项都露出来后重按',
+  );
 });
 t('index=1.5 非整数 → 空串', () => {
   assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 1.5 } }, q4), '');
 });
-t('多选 indices 越界被过滤', () => {
+t('index=30 超过 Z → 空串', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 30 } }, q4), '');
+});
+t('2 个选项但模型给 index=2 → 输出 C 并提示（真机高频场景）', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { selectedIndex: 2 } }, q2), 'C（选项未读全，请核对）');
+});
+t('多选 indices 保留字母，超出部分不丢', () => {
   const out = renderAnswer(
     { mode: 'json', params: { indicesJson: '[0,2,7]' } },
     { ...q4, type: 'multi' },
   );
-  assert.equal(out, 'A 传输层 ; C 数据链路层');
+  assert.equal(out, 'A 传输层 ; C 数据链路层 ; H');
 });
-t('多选全越界 → 空串', () => {
-  assert.equal(renderAnswer({ mode: 'json', params: { indicesJson: '[9,10]' } }, q4), '');
+t('多选含负数 → 过滤掉负数，保留合法项', () => {
+  const out = renderAnswer(
+    { mode: 'json', params: { indicesJson: '[-1,1,2]' } },
+    { ...q4, type: 'multi' },
+  );
+  assert.equal(out, 'B 网络层 ; C 数据链路层');
+});
+t('多选全越界 → 保留字母', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { indicesJson: '[9,10]' } }, q4), 'J ; K');
+});
+t('多选全非法（负数）→ 空串', () => {
+  assert.equal(renderAnswer({ mode: 'json', params: { indicesJson: '[-1,-2]' } }, q4), '');
 });
 
 console.log('\n=== 9. 回归：空 stem 图片题不进缓存（review 修复）===');
@@ -203,6 +229,43 @@ t('两张不同图片题（空 stem + 相同选项）不再撞键', () => {
   // 都为 null，且 AnswerCache 会把 null 当「不缓存」而不是「同一个键」
   assert.equal(a, null);
   assert.equal(b, null);
+});
+
+console.log('\n=== 10. 回归：占位引擎不污染缓存（真机实测）===');
+// 真机踩到：heuristic 把多选题写成 indices:[0]，hits=43。
+// 用户看到 "A GET" 以为是真答案，其实是 index:0 的占位。
+const cache = new (await import('./answer-cache.mjs')).AnswerCache(':memory:');
+t('heuristic 占位答案不该进缓存（由调用方拦截，此处验缓存本身会存）', () => {
+  // 缓存层不判断来源，拦截在 solve() 里。这里验证 cache.put 的返回值语义：
+  const q = { stem: '占位引擎测试题', options: [{ key: 'A', text: 'x' }] };
+  const wrote = cache.put(q, { mode: 'json', type: 'single', params: { selectedIndex: 0 } }, 'heuristic');
+  assert.ok(wrote, '缓存层本身允许写入（拦截逻辑在 solve）');
+  // 关键：能删掉
+  assert.ok(cache.delete(q), 'heuristic 条目必须可删除，否则脏数据永久留着');
+  assert.equal(cache.get(q), null, '删掉后不应再命中');
+});
+
+console.log('\n=== 11. 回归：选项不足时拒绝作答（真机实测 54s 答错）===');
+// 真机踩到：微信 WebView 吃掉 C 选项前缀，4 个选项只读到 2 个。
+// 模型对「两个选项都不对」的题会思考 54s，然后硬凑 index:0 答错。
+// 服务端 guard 必须在调模型之前就拦住。
+const src = await import('node:fs').then((fs) =>
+  fs.readFileSync(new URL('./answer-server.mjs', import.meta.url), 'utf8'));
+t('answer-server 里有选项数 guard（optCount < 3）', () => {
+  assert.ok(src.includes('optCount < 3'), '必须存在 optCount < 3 的拦截');
+});
+t('guard 命中时 source=none，不写缓存也不调模型', () => {
+  // 静态检查：guard 的 return 里带 source:'none'
+  const i = src.indexOf('optCount < 3');
+  const seg = src.slice(i, i + 600);
+  assert.ok(seg.includes("source: 'none'"), 'guard 返回必须是 source:none');
+  assert.ok(seg.includes('请滚动让选项露全'), '必须给用户可操作的提示');
+});
+t('guard 在缓存查询之前（避免脏缓存绕过）', () => {
+  const guardAt = src.indexOf('optCount < 3');
+  const cacheAt = src.indexOf('// 1. 缓存');
+  assert.ok(guardAt > 0 && cacheAt > 0);
+  assert.ok(guardAt < cacheAt, 'guard 必须早于缓存查询');
 });
 
 console.log('\n' + '='.repeat(56));

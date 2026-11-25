@@ -134,7 +134,25 @@ export async function qoderChat(messages, opts = {}) {
   let buf = '';
   let err = null;
 
-  const timer = setTimeout(() => { err = err || new Error(`qoder 超时 ${timeoutMs}ms`); }, timeoutMs);
+  // 超时必须真的中断请求，不能只设一个变量。
+  // 原来只写 err，await chatStream 完全不受影响 —— 请求卡住就永久挂起，
+  // 外层 HTTP 也没有超时，手机端断开后这个 Promise 永远挂着、内存不释放。
+  // 实测踩到过：一次 58s 才返回（from=-，手机早断开了）。
+  const ac = new AbortController();
+  const timer = setTimeout(() => {
+    err = err || new Error(`qoder 超时 ${timeoutMs}ms`);
+    try { ac.abort(err); } catch { /* ignore */ }
+  }, timeoutMs);
+
+  // 调用方传进来的 signal 也要接上（HTTP 断开时能及时止损）
+  const onOuterAbort = () => {
+    err = err || new Error('请求被取消');
+    try { ac.abort(err); } catch { /* ignore */ }
+  };
+  if (opts.signal) {
+    if (opts.signal.aborted) onOuterAbort();
+    else opts.signal.addEventListener('abort', onOuterAbort, { once: true });
+  }
 
   try {
     await client.chatStream(_pat, modelKey, payload, {
@@ -146,10 +164,11 @@ export async function qoderChat(messages, opts = {}) {
         if (delta && typeof delta.content === 'string') buf += delta.content;
         else if (delta && typeof delta.text === 'string') buf += delta.text;
       },
-      signal: opts.signal,
+      signal: ac.signal,
     });
   } finally {
     clearTimeout(timer);
+    if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbort);
   }
   if (err) throw err;
   return buf.trim();

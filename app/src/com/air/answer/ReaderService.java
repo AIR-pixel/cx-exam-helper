@@ -1169,11 +1169,39 @@ public class ReaderService extends AccessibilityService {
         }
 
         // 2. 选项：匹配 A. / A、/ A) 开头的行，记录首选项 y
-        java.util.regex.Pattern optRe = java.util.regex.Pattern.compile("^\\s*[A-J][.、)）]\\s*\\S.*");
+        //
+        //    真机踩坑（m.topnews.cn 微信 WebView）：C 选项的「C.」前缀在 a11y 里
+        //    是独立节点或被 CSS 隐藏，报上来的文本是「年满18 周岁、中国公民…」——
+        //    没有前缀。原来的正则要求字母后必须跟分隔符，于是 C 被漏掉，
+        //    4 个选项只读到 2 个（A、B），模型给 index=2 就被判越界。
+        //
+        //    两道正则：
+        //      严格：A. / A、/ A)  —— 优先
+        //      宽松：单个字母 + 空白 + 长文本，且该字母恰好是「下一个期望的字母」
+        //            才能收，避免把「A 和 B 都正确」这类正文误判成选项。
+        java.util.regex.Pattern optStrict = java.util.regex.Pattern.compile("^\\s*[A-J][.、)）、:：]\\s*\\S.*");
+        java.util.regex.Pattern optLoose = java.util.regex.Pattern.compile("^\\s*([A-J])\\s+\\S.{3,}");
+        String expectKey = "A";
         for (TextNode n : nodes) {
-            if (optRe.matcher(n.text).matches()) {
+            if (optStrict.matcher(n.text).matches()) {
                 options.add(n.text);
                 if (firstOptTop < 0) firstOptTop = n.top;
+                // 严格匹配后推进期望字母
+                java.util.regex.Matcher m0 = java.util.regex.Pattern.compile("^\\s*([A-J])").matcher(n.text);
+                if (m0.find()) {
+                    expectKey = String.valueOf((char) (m0.group(1).charAt(0) + 1));
+                }
+                continue;
+            }
+            // 宽松匹配：只在「已经收到至少一个严格选项」且「字母正是期望的下一个」时收。
+            // 这样 C 掉了前缀还能补回来，又不会把正文里的「A 和 B」误当选项。
+            if (!options.isEmpty()) {
+                java.util.regex.Matcher m1 = optLoose.matcher(n.text);
+                if (m1.find() && m1.group(1).equals(expectKey)) {
+                    options.add(m1.group(1) + ". " + n.text.trim());
+                    expectKey = String.valueOf((char) (expectKey.charAt(0) + 1));
+                    Log.d(TAG, "OPT loose-recovered key=" + m1.group(1) + " text=" + n.text);
+                }
             }
         }
 
