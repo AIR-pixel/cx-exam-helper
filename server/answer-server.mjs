@@ -34,6 +34,7 @@
 
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
+import crypto from 'node:crypto';
 import { parseScreen, parseStructured, parseAnswerText, countBlanks, detectType,
          isOcrUiNoise, stripLeadingUiCrumb } from './answer-core.mjs';
 import { AnswerCache } from './answer-cache.mjs';
@@ -256,6 +257,135 @@ async function engineQoderVision(q, image) {
       timeoutMs: Number(process.env.ANSWER_VL_TIMEOUT_MS || 90000),
     },
   );
+}
+
+/**
+ * 纯视觉引擎：整屏截图交给模型，由模型自己找出题目、选项、题型。
+ *
+ * ── 为什么需要它 ──
+ *
+ * 原来的主路径是「OCR 抄文字 → 几何恢复猜版式 → 文本模型作答」。这条路
+ * 一直在跟版式搏斗，每遇到一种新排版就踩一个坑：
+ *   第 7 题：标签是裸块（只有 "A."）+ 正文首行在标签上方 → 只读到 2 选项
+ *   第 10 题：标签在正文右下 → baseX 用错坐标系 → 只读到 2 选项
+ *   第 5 题：题干 4 行 → 固定行数裁剪把「多选题」标签切掉 → 多选判成单选
+ * 每次修 A 又踩坏 B（第 5 题就是修第 10 题引入的回归）。
+ *
+ * 而视觉模型根本不需要这些中间层 —— 它直接看图，题目在哪、有几个选项、
+ * 是单选还是多选，一眼就知道。实测三题（都是之前踩过坑的）：
+ *
+ *   第 5 题（多选）  5204ms  type=multi  stem 完整  options 4  indices[0,1] ✓
+ *   第 10 题（单选） 8637ms  type=single stem 完整  options 4  indices[1]   ✓
+ *   第 7 题（单选） 10580ms  type=single stem 完整  options 4  indices[1]   ✓
+ *
+ * 而且第 10 题的题干比 OCR 版更准：OCR 读成「通过了哪 () 一文件?」，
+ * 视觉读成「通过了哪一文件？（ ）」—— OCR 把一行拆成两段导致语序断裂。
+ *
+ * ── 代价 ──
+ *
+ * 一张 1080x2400 PNG 转 base64 约 330KB，比 OCR 的纯文本贵得多，也更慢
+ * （5~11s vs OCR 5.5s + 引擎 1~2s）。所以它**不是无条件更好**，而是
+ * 「OCR 判不准时更可靠」。默认策略见 VISION_MODE。
+ *
+ * ── 输出契约 ──
+ *
+ * 要求模型返回结构化的题干/选项/下标，而不是只给一个字母。这样：
+ *   · 选项数以模型读到的为准，不受 OCR 漏字影响
+ *   · 浮层能显示选项原文（用户能核对是不是这一题）
+ *   · indices 直接映射字母，不需要几何恢复
+ */
+async function engineQoderVisionFull(image) {
+  const b64 = await imageToBase64(image);
+  if (!b64) throw new Error('图片解码失败');
+  if (b64.startsWith('__SVG__')) throw new Error('SVG 走文本抽取，不需要视觉');
+
+  const mime = detectImageMime(b64);
+  const url = `data:${mime};base64,${b64}`;
+
+  const sys = [
+    '你是答题助手，回答中国高校在线课程的客观题。',
+    '看这张手机截图，自己找出题目和选项。',
+    '截图里除了题目还有：状态栏（时间/电量/信号）、网页标题栏、答题进度、',
+    '上一题/下一题按钮、以及上一题答案的浮层 —— 这些都不是题目，忽略它们。',
+    '',
+    '先判断题型，再作答。严格只输出这个 JSON，不要解释、不要 markdown：',
+    '{"type":"single|multi|judge|blank|short",',
+    ' "stem":"题干原文",',
+    ' "options":["A项原文","B项原文",...],',
+    ' "indices":[选中项下标，0 基]}',
+    '',
+    '单选题和判断题只给一个下标；多选题给多个。',
+    '选项原文照抄图里的文字，不要改写、不要编号（不要带 "A." 前缀）。',
+  ].join('\n');
+
+  return qoderChat(
+    [
+      { role: 'system', content: sys },
+      { role: 'user', content: '看这张截图，作答。' },
+    ],
+    {
+      model: process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel',
+      images: [url],
+      timeoutMs: Number(process.env.ANSWER_VL_TIMEOUT_MS || 90000),
+    },
+  );
+}
+
+/**
+ * 把 engineQoderVisionFull 的返回解析成标准的 solve() 结果。
+ *
+ * 和文本路径的区别：这里 q 是模型自己读出来的，不是 OCR 拼的。
+ * 所以 type / options 都以模型为准，不需要 detectType 再猜一遍。
+ *
+ * @returns {{ok:boolean, type?:string, stem?:string, options?:Array, indices?:Array, reason?:string}}
+ */
+function parseVisionFull(raw) {
+  const j = extractJsonLoose(raw);
+  if (!j) return { ok: false, reason: '视觉返回不是 JSON' };
+
+  const stem = String(j.stem || '').trim();
+  const optsRaw = Array.isArray(j.options) ? j.options : [];
+  // 选项可能带 "A. " 前缀（模型偶尔不听话），剥掉统一由下游编号
+  const options = optsRaw.map((s) => {
+    const t = String(s == null ? '' : s).trim();
+    const m = t.match(/^[（(]?[A-H][)）]?\s*[.、．)）:：]\s*(.*)$/);
+    return m ? m[1].trim() : t;
+  }).filter((s) => s.length > 0);
+
+  let indices = Array.isArray(j.indices) ? j.indices : [];
+  if (!indices.length && Number.isInteger(j.index)) indices = [j.index];
+  indices = indices.map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < 26);
+
+  if (!stem) return { ok: false, reason: '视觉没读出题干' };
+  if (options.length < 2) return { ok: false, reason: `视觉只读到 ${options.length} 个选项` };
+  if (!indices.length) return { ok: false, reason: '视觉没给出答案下标' };
+
+  // 题型：优先用模型自己判的，只接受已知值
+  const t = String(j.type || '').toLowerCase();
+  const type = ['single', 'multi', 'judge', 'blank', 'short'].includes(t) ? t : null;
+  // 模型判单选却给了多个下标 → 以 indices 为准改判多选（同 parseAnswerText 的规则）
+  const finalType = type === 'multi' || indices.length > 1
+    ? 'multi'
+    : (type || 'single');
+
+  return { ok: true, type: finalType, stem, options, indices };
+}
+
+/** 宽松 JSON 抽取：容忍 ```json 围栏、前后废话 */
+function extractJsonLoose(raw) {
+  const s = String(raw || '').trim();
+  const tryParse = (t) => { try { return JSON.parse(t); } catch { return null; } };
+  let v = tryParse(s);
+  if (v) return v;
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) { v = tryParse(fence[1].trim()); if (v) return v; }
+  const first = s.indexOf('{');
+  const last = s.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    v = tryParse(s.slice(first, last + 1));
+    if (v) return v;
+  }
+  return null;
 }
 
 /** 从 base64 头部嗅探图片类型；视觉通道要求 data URI 的 mime 正确 */
@@ -1122,6 +1252,7 @@ const server = http.createServer(async (req, res) => {
       let structured = null;
       let force = false;
       let fast = false;
+      let reqVision = '';
       try {
         const j = JSON.parse(body);
         text = j.question || '';
@@ -1134,8 +1265,87 @@ const server = http.createServer(async (req, res) => {
         // 快档（手机端 Vol+ ×2）：换快模型 + 浅思考。
         // 只在 qoder 通道生效；heuristic/openai/echo 没有思考这个概念，忽略。
         fast = j.fast === true;
+        // 视觉模式（手机端可按请求覆盖环境变量）：'' | 'first' | 'only'
+        reqVision = typeof j.vision === 'string' ? j.vision : '';
       } catch { text = body; }
       const t0 = Date.now();
+
+      // ── 视觉主路径（VISION_MODE=first）──
+      //
+      // 整屏截图直接交给模型，由它自己找题目、选项、题型 —— 不做 OCR，
+      // 不做几何恢复。这是「AI 自己知道题目在哪」的方案。
+      //
+      // 为什么值得做成主路径：OCR + 几何恢复这条路一直在跟版式搏斗，
+      // 每遇到一种新排版就踩一个坑（第 7/10/5 题各一个），而且修 A 会踩坏 B。
+      // 实测三道踩过坑的题，纯视觉全部一次答对，题干还更完整。
+      //
+      // 但默认仍是 off —— 视觉一张 330KB 图要 5~11s，比 OCR 贵也慢；
+      // OCR 在标准版式上 7s 就能出结果。用 AIR 的按钮决定：
+      //   · off    （默认）OCR 优先，OCR 判不出才走视觉（原行为）
+      //   · first  视觉优先，失败才退回 OCR 路径
+      //   · only   只走视觉，不碰 OCR
+      //
+      // 手机端可以按请求传 vision:"first"/"only" 覆盖，方便对比实测。
+      const visionMode = (reqVision || process.env.VISION_MODE || 'off').toLowerCase();
+      if (image && visionMode !== 'off' && (engineMode === 'qoder' || engineMode === 'auto')) {
+        try {
+          console.log(`[vision-first] 整屏交给模型 model=${process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel'}`);
+          const vraw = await engineQoderVisionFull(image);
+          const v = parseVisionFull(vraw);
+          if (v.ok) {
+            const vq = {
+              stem: v.stem,
+              options: v.options.map((t, i) => ({ key: String.fromCharCode(65 + i), text: t })),
+              type: v.type,
+              typeLabel: '',
+            };
+            const vnorm = {
+              mode: 'json',
+              type: v.type,
+              params: v.indices.length > 1
+                ? { indicesJson: JSON.stringify(v.indices) }
+                : { selectedIndex: v.indices[0] },
+            };
+            const vanswer = renderAnswer(vnorm, vq);
+            if (vanswer) {
+              console.log(`[vision-first] ${Date.now() - t0}ms type=${v.type} `
+                + `opts=${vq.options.length} => ${vanswer.slice(0, 60)}`);
+              const vstable = `${v.stem}|${vq.options.map((o) => o.text).join('|')}`;
+              const vhash = crypto.createHash('md5').update(vstable).digest('hex');
+              pushAdd(
+                `${vanswer}\n\n[vision · ${v.type} · ${Date.now() - t0}ms]`,
+                'answer',
+              );
+              return json(res, {
+                answer: vanswer,
+                source: 'vision',
+                type: v.type,
+                question: vq,
+                screenHash: vhash,
+                stableKey: vstable,
+                ms: Date.now() - t0,
+              });
+            }
+            console.warn('[vision-first] 渲染空答案，退回 OCR 路径');
+          } else {
+            console.warn(`[vision-first] 不可用：${v.reason}，退回 OCR 路径`);
+          }
+        } catch (e) {
+          console.warn(`[vision-first] 失败：${e.message}，退回 OCR 路径`);
+        }
+        // only 模式不退回 OCR —— 用户明确要求只走视觉，退回会让人分不清
+        // 到底是哪条路径出的结果。直接报错，信息更明确。
+        if (visionMode === 'only') {
+          return json(res, {
+            answer: '视觉识别失败（VISION_MODE=only，未退回 OCR）',
+            source: 'error',
+            type: null,
+            question: null,
+            ms: Date.now() - t0,
+          });
+        }
+      }
+
       // 图片题兜底：a11y 没读到题干但手机传了截图 → OCR 补文字
       let ocrText = '';
       let ocrBoxes = null;
@@ -1186,6 +1396,8 @@ export const __test_cleanOcrText = cleanOcrText;
 export const __test_shouldUseVision = shouldUseVision;
 export const __test_detectImageMime = detectImageMime;
 export const __test_renderAnswer = renderAnswer;
+export const __test_parseVisionFull = parseVisionFull;
+export const __test_extractJsonLoose = extractJsonLoose;
 
 if (process.env.ANSWER_NO_LISTEN !== '1') {
   server.listen(PORT, BIND, () => {

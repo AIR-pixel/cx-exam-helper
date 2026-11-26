@@ -151,15 +151,24 @@ public class ReaderService extends AccessibilityService {
      * @param fast true = 快速识别（Vol+ ×2），要求服务端用浅思考档
      */
     public static void forceScanNow(boolean fast) {
+        forceScanNow(fast, null);
+    }
+
+    /**
+     * @param fast   true = 快速识别，要求服务端用浅思考档
+     * @param vision 视觉模式：null = 用服务端配置；"first" = 视觉优先；
+     *               "only" = 只走视觉。整屏截图交给视觉模型，跳过 OCR + 几何恢复。
+     */
+    public static void forceScanNow(boolean fast, String vision) {
         ReaderService s = sInstance;
         if (s == null) {
             android.util.Log.w("ReaderService", "forceScan: service not connected");
             return;
         }
-        s.doForceScan(fast);
+        s.doForceScan(fast, vision);
     }
 
-    private void doForceScan(boolean fast) {
+    private void doForceScan(boolean fast, String vision) {
         // 用户主动按的，不受冷却限制，但也要避开正在飞的请求
         if (inFlight && System.currentTimeMillis() - inFlightSince < IN_FLIGHT_TIMEOUT_MS) {
             Bus.publishStatus("正在作答中，请稍候…", "busy");
@@ -168,7 +177,10 @@ public class ReaderService extends AccessibilityService {
         inFlight = false; inFlightSince = 0;          // 超时或残留状态，强制放行
         forceNext = true;
         fastNext = fast;
-        Bus.publishStatus(fast ? "快速识别中…" : "正在识别当前页面…", "busy");
+        visionNext = vision;
+        String busyText = vision != null ? "视觉识别中…（较慢）"
+                : (fast ? "快速识别中…" : "正在识别当前页面…");
+        Bus.publishStatus(busyText, "busy");
         // 走和自动扫描同一条链路，只是带上 force 标记
         scanGen++;
         if (pending != null) { h.removeCallbacks(pending); pending = null; }
@@ -200,6 +212,15 @@ public class ReaderService extends AccessibilityService {
     private volatile boolean fastNext = false;
 
     /**
+     * 下一次上送是否走视觉模式（"first" / "only"）。用完即清。
+     *
+     * 和 fastNext 一样是一次性标志：视觉慢（3~15s vs 1.6~5.7s），
+     * 但准确率高（OCR 会把「第十五个五年」读成「第十五人五年」、
+     * 把「劳动收入」读成「劳动」）。做成一次性按钮，让用户按需选。
+     */
+    private volatile String visionNext = null;
+
+    /**
      * 强制标记的线程级传递。
      *
      * handleText / handleWithImageUrl / handleWithOcr 各自在新线程里调 askPC，
@@ -217,6 +238,12 @@ public class ReaderService extends AccessibilityService {
      * 结果把正在跑的自动扫描也改成了快档。
      */
     private static final ThreadLocal<Boolean> FAST_TLS = new ThreadLocal<Boolean>();
+
+    /**
+     * 视觉模式的 ThreadLocal，同 FAST_TLS 的理由。
+     * 值："first" / "only"，null = 不指定（用服务端配置）。
+     */
+    private static final ThreadLocal<String> VISION_TLS = new ThreadLocal<String>();
 
     /**
      * 配置页用：真正注销无障碍服务。
@@ -485,24 +512,27 @@ public class ReaderService extends AccessibilityService {
             forceNext = false;
             final boolean fast = fastNext;
             fastNext = false;
+            final String vision = visionNext;
+            visionNext = null;
             Log.d(TAG, "FORCE scan: chars=" + text.length()
                     + " fast=" + fast
+                    + " vision=" + vision
                     + " isExamPage=" + isExamPage(text)
                     + " looksLikeQ=" + looksLikeQuestion(text));
             if (text.trim().length() >= MIN_TEXT_LEN) {
                 // 有可见文字：直接送。图片题也在这里分流（有选项无题干 → OCR）
                 if (isImageQuestion()) {
                     String imgUrl = firstImageUrl();
-                    if (!imgUrl.isEmpty()) { handleWithImageUrl(text, imgUrl, true, fast); return; }
-                    handleWithOcr(text, true, fast);
+                    if (!imgUrl.isEmpty()) { handleWithImageUrl(text, imgUrl, true, fast, vision); return; }
+                    handleWithOcr(text, true, fast, vision);
                     return;
                 }
-                handleText(text, true, fast);
+                handleText(text, true, fast, vision);
                 return;
             }
             // 文字太少（纯图片页 / Canvas 自绘）：只能截屏 OCR
             Log.d(TAG, "FORCE scan: too little text, go OCR");
-            handleWithOcr(text, true, fast);
+            handleWithOcr(text, true, fast, vision);
             return;
         }
 
@@ -534,7 +564,7 @@ public class ReaderService extends AccessibilityService {
             // 但必须先过页面闸门：登录页/首页/toast 也会走到这里，
             // 不过闸就会把整屏截图上送模型，烧额度还糊一屏废话。
             if (ToggleStore.appOn() && isExamPage(text)) {
-                handleWithOcr(text, false, false);
+                handleWithOcr(text, false, false, null);
             } else {
                 Log.d(TAG, "OCR fallback skipped: not an exam page");
                 Bus.publishStatus("未识别到题目（当前不是答题页）", "off");
@@ -549,7 +579,7 @@ public class ReaderService extends AccessibilityService {
             String imgUrl = firstImageUrl();
             if (!imgUrl.isEmpty()) {
                 Log.d(TAG, "image url found: " + (imgUrl.length() > 80 ? imgUrl.substring(0, 80) + "…" : imgUrl));
-                handleWithImageUrl(text, imgUrl, false, false);
+                handleWithImageUrl(text, imgUrl, false, false, null);
                 return;
             }
             Log.d(TAG, "no image url in a11y tree, fallback to screenshot OCR");
@@ -562,10 +592,10 @@ public class ReaderService extends AccessibilityService {
                     Log.w(TAG, "tree dump failed: " + t);
                 }
             }
-            handleWithOcr(text, false, false);
+            handleWithOcr(text, false, false, null);
             return;
         }
-        handleText(text, false, false);
+        handleText(text, false, false, null);
     }
 
     /**
@@ -776,7 +806,14 @@ public class ReaderService extends AccessibilityService {
      *   · 服务端走同一条 imageStem 分支，OCR/解码结果接管题干
      */
     private void handleWithImageUrl(final String a11yText, final String url, final boolean force,
-                                    final boolean fast) {
+                                    final boolean fast, final String vision) {
+        // 视觉模式要整屏截图（含题干+选项+版式），不是单张题目配图。
+        // 配图 URL 交给视觉模型反而丢掉了题干和选项位置，所以转截图路径。
+        if (vision != null && !vision.isEmpty()) {
+            Log.d(TAG, "handleWithImageUrl: vision mode=" + vision + "，改走整屏截图");
+            handleWithOcr(a11yText, force, fast, vision);
+            return;
+        }
         if (inFlight) { deferredScan = true; return; }
         // 发送前就去重：同一张图（URL 相同）已经答过就别再发请求。
         // 不这么做的话，轮询每 2.5s 一跳都会把同一张图重发一遍，
@@ -803,6 +840,7 @@ public class ReaderService extends AccessibilityService {
             try {
                 FORCE_TLS.set(force);
                 FAST_TLS.set(fast);
+                VISION_TLS.set(vision);
                 String struct = readStructured();
                 // 直接把 URL 当 image 字段上送；服务端能识别 data:/http 前缀
                 Answer a = askPC(a11yText == null ? "" : a11yText, url,
@@ -835,7 +873,8 @@ public class ReaderService extends AccessibilityService {
         } }, "imgurl").start();
     }
 
-    private void handleWithOcr(final String a11yText, final boolean force, final boolean fast) {
+    private void handleWithOcr(final String a11yText, final boolean force, final boolean fast,
+                               final String vision) {
         if (inFlight) return;
         // 同一屏不重复截屏 OCR。
         // 轮询每 2.5s 一跳，若每次都 hide→screencap→show，叠层会不停闪，
@@ -858,6 +897,7 @@ public class ReaderService extends AccessibilityService {
             try {
                 FORCE_TLS.set(force);
                 FAST_TLS.set(fast);
+                VISION_TLS.set(vision);
                 // 截屏前必须先把叠层藏起来。
                 // screencap 是像素级抓取，会把 TYPE_ACCESSIBILITY_OVERLAY 窗口
                 // 一起拍进去 —— 上一题的答案卡片正好盖在题干上，OCR 读到的
@@ -957,7 +997,16 @@ public class ReaderService extends AccessibilityService {
         }
     }
 
-    private void handleText(final String text, final boolean force, final boolean fast) {
+    private void handleText(final String text, final boolean force, final boolean fast,
+                            final String vision) {
+        // 视觉模式必须带图 —— 整屏截图才是视觉模型的输入，纯文本没有意义。
+        // 转走 handleWithOcr：它会 screencap 再把 base64 一起上送。
+        // 这是 vision 模式的核心：不再依赖 a11y 文本，只看像素。
+        if (vision != null && !vision.isEmpty()) {
+            Log.d(TAG, "handleText: vision mode=" + vision + "，改走截图路径");
+            handleWithOcr(text, force, fast, vision);
+            return;
+        }
         final String q = text;
         final String structured = readStructured();
         Log.d(TAG, "READ " + text.length() + " chars:\n"
@@ -967,6 +1016,7 @@ public class ReaderService extends AccessibilityService {
             try {
                 FORCE_TLS.set(force);
                 FAST_TLS.set(fast);
+                VISION_TLS.set(vision);
                 Answer a = askPC(q, null, structured);
                 if (a == null) return;
                 // 服务端判定为非题目（题干清洗后只剩页面装饰）：不糊叠层、不占去重位
@@ -1036,8 +1086,12 @@ public class ReaderService extends AccessibilityService {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setDoOutput(true);
             conn.setConnectTimeout(3000);
-            // OCR 可能耗时几秒，给足读超时
-            conn.setReadTimeout(image == null ? 30000 : 45000);
+            // OCR 可能耗时几秒，给足读超时。
+            // 视觉模式实测最长 15.4s（长题干），加上服务端排队和网络余量，
+            // 45s 不够稳 —— 超时会白等一轮，用户以为卡死。视觉单独给 90s。
+            String vmode0 = VISION_TLS.get();
+            boolean isVision = vmode0 != null && !vmode0.isEmpty();
+            conn.setReadTimeout(isVision ? 90000 : (image == null ? 30000 : 45000));
 
             JSONObject body = new JSONObject();
             body.put("question", question);
@@ -1051,6 +1105,10 @@ public class ReaderService extends AccessibilityService {
             if (Boolean.TRUE.equals(FORCE_TLS.get())) body.put("force", true);
             // 快速档：服务端据此选浅思考/无思考模型，牺牲一点推理换响应速度
             if (Boolean.TRUE.equals(FAST_TLS.get())) body.put("fast", true);
+            // 视觉模式：整屏截图交给视觉模型，由它自己找题目/选项/题型，
+            // 跳过 OCR + 几何恢复。值 "first"=视觉优先、"only"=只走视觉。
+            String vmode = VISION_TLS.get();
+            if (vmode != null && !vmode.isEmpty()) body.put("vision", vmode);
             if (structured != null && !structured.isEmpty()) {
                 // 区域抽取结果：JSON 对象字符串，PC 端优先用它（不再猜题干/选项）
                 try { body.put("structured", new JSONObject(structured)); }

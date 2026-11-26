@@ -62,6 +62,18 @@ const DEFAULT_CONFIG = {
   vlModel: '',              // 留空 = 用 qoderModel；实测 dfmodel/gmodel_latest/mmodel 都支持看图
   visionMinHan: 8,          // OCR 有效汉字低于这个数就判为「读不出题干」
   visionTimeoutMs: 90000,
+  // 视觉主路径：整屏截图直接交给模型，由它自己找题目/选项/题型。
+  //
+  //   'off'   （默认）OCR 优先，OCR 判不出才走视觉 —— 原行为
+  //   'first' 视觉优先，失败才退回 OCR
+  //   'only'  只走视觉，不碰 OCR
+  //
+  // 为什么默认 off 而不是 first：视觉慢。实测同一张 1080x2400 截图，
+  // OCR 路径 1.6~5.7s，视觉 3.1~15.4s（题干越长差得越多）。
+  // 但视觉准确率明显更高 —— 同一批题 OCR 把「第十五个五年」读成
+  // 「第十五人五年」、把「劳动收入」读成「劳动」、漏掉「额」「而当」，
+  // 视觉全对。所以这是个「要不要为准确率付时间」的选择，交给用户定。
+  visionMode: 'off',
   // OpenAI 兼容 API
   openaiBase: '',
   openaiKey: '',
@@ -108,6 +120,8 @@ function buildEnv() {
   if (config.vlModel) env.QODER_VL_MODEL = config.vlModel;
   if (config.visionMinHan != null) env.ANSWER_VISION_MIN_HAN = String(config.visionMinHan);
   if (config.visionTimeoutMs) env.ANSWER_VL_TIMEOUT_MS = String(config.visionTimeoutMs);
+  // 视觉主路径模式。必须显式传 —— 子进程读不到 manager 的内存配置。
+  if (config.visionMode) env.VISION_MODE = config.visionMode;
   if (config.openaiBase) env.OPENAI_BASE = config.openaiBase;
   if (config.openaiKey) env.OPENAI_KEY = config.openaiKey;
   if (config.openaiModel) env.OPENAI_MODEL = config.openaiModel;

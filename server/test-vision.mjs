@@ -268,6 +268,108 @@ t('guard 在缓存查询之前（避免脏缓存绕过）', () => {
   assert.ok(guardAt < cacheAt, 'guard 必须早于缓存查询');
 });
 
+console.log('\n=== 12. 视觉主路径：整屏交给模型（真机实测三题）===');
+// 背景：OCR + 几何恢复那条路一直在跟版式搏斗，第 7/10/5 题各踩一个坑，
+// 而且修 A 会踩坏 B。改成「整屏截图直接交给视觉模型，它自己找题目」。
+//
+// 真机三题实测（都是之前踩过坑的）：
+//   第5题(多选) 11258ms type=multi  stem完整 opts=4 indices[0,1] ✓
+//   第10题(单选) 3080ms type=single stem完整 opts=4 indices[1]   ✓
+//   第7题(单选) 15449ms type=single stem完整 opts=4 indices[1]   ✓
+// 而且 OCR 的错字在视觉版里全都没有：
+//   「第十五个五年」OCR 读成「第十五人五年」
+//   「劳动收入」OCR 读成「劳动」，还漏掉「额」「而当」
+const { __test_parseVisionFull: parseVisionFull } = await import('./answer-server.mjs');
+
+t('视觉：正常 JSON 解析', () => {
+  const r = parseVisionFull(JSON.stringify({
+    type: 'multi',
+    stem: '该酒店可能违反的义务包括？',
+    options: ['询问监护人联系方式', '遵守禁入规定', '临时监护', '学校管理'],
+    indices: [0, 1],
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(r.type, 'multi');
+  assert.equal(r.options.length, 4);
+  assert.deepEqual(r.indices, [0, 1]);
+});
+
+t('视觉：选项带 "A." 前缀要剥掉', () => {
+  // 模型偶尔不听话，把编号写进选项原文
+  const r = parseVisionFull(JSON.stringify({
+    type: 'single', stem: '题', options: ['A. 甲', 'B、乙', '(C) 丙', 'D．丁'], indices: [2],
+  }));
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.options, ['甲', '乙', '丙', '丁']);
+});
+
+t('视觉：```json 围栏能剥', () => {
+  const r = parseVisionFull('```json\n{"type":"single","stem":"题","options":["a","b"],"indices":[1]}\n```');
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.indices, [1]);
+});
+
+t('视觉：前后有废话也能抠出 JSON', () => {
+  const r = parseVisionFull('好的，答案是：{"type":"single","stem":"题","options":["a","b"],"indices":[0]} 以上。');
+  assert.equal(r.ok, true);
+  assert.equal(r.type, 'single');
+});
+
+t('视觉：判单选却给多个下标 → 改判多选', () => {
+  // 同 parseAnswerText 的规则：以 indices 为准
+  const r = parseVisionFull(JSON.stringify({
+    type: 'single', stem: '题', options: ['a', 'b', 'c'], indices: [0, 2],
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(r.type, 'multi', '多下标必须改判多选，不能砍成一个');
+  assert.deepEqual(r.indices, [0, 2]);
+});
+
+t('视觉：没读出题干要拒绝', () => {
+  const r = parseVisionFull(JSON.stringify({ type: 'single', options: ['a', 'b'], indices: [0] }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /题干/);
+});
+
+t('视觉：选项不足 2 个要拒绝', () => {
+  const r = parseVisionFull(JSON.stringify({ type: 'single', stem: '题', options: ['只有一个'], indices: [0] }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /选项/);
+});
+
+t('视觉：没给下标要拒绝（不能瞎猜）', () => {
+  const r = parseVisionFull(JSON.stringify({ type: 'single', stem: '题', options: ['a', 'b'] }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /下标/);
+});
+
+t('视觉：非法下标被过滤', () => {
+  const r = parseVisionFull(JSON.stringify({
+    type: 'multi', stem: '题', options: ['a', 'b', 'c'], indices: [0, -1, 99, 'x', 2],
+  }));
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.indices, [0, 2], '负数/越界/非数字都要丢掉');
+});
+
+t('视觉：非 JSON 返回要拒绝', () => {
+  const r = parseVisionFull('我看不清这张图');
+  assert.equal(r.ok, false);
+});
+
+t('answer-server 里视觉主路径在 OCR 之前', () => {
+  const vAt = src.indexOf('VISION_MODE');
+  const ocrAt = src.indexOf('const o = await ocrImageEx(image)');
+  assert.ok(vAt > 0 && ocrAt > 0, '两处都必须存在');
+  assert.ok(vAt < ocrAt, '视觉主路径必须早于 OCR —— 否则先花 5s OCR 再走视觉，白等');
+});
+
+t('vision=only 失败时不退回 OCR', () => {
+  const i = src.indexOf("visionMode === 'only'");
+  assert.ok(i > 0, '必须有 only 的专门分支');
+  const seg = src.slice(i, i + 400);
+  assert.ok(seg.includes("source: 'error'"), 'only 失败要明确报错，不能静默退回');
+});
+
 console.log('\n' + '='.repeat(56));
 if (fail === 0) console.log(`PASS  ${pass} 项通过，全部`);
 else console.log(`FAIL  ${pass} 通过 / ${fail} 失败`);

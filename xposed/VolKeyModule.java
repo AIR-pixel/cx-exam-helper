@@ -242,8 +242,20 @@ public class VolKeyModule implements IXposedHookLoadPackage {
             // 双击及以上：把音量还原，用户不该因为按了快捷键而被改音量
             restoreVolUpVolume();
             vibrate();
-            XposedBridge.log(TAG + " Vol+ x" + n + " -> fast scan");
-            sendBroadcast("fast");
+            // Vol+ ×2 = 快速识别（浅思考，1~2s）
+            // Vol+ ×3 = 视觉识别（整屏交给视觉模型，3~15s，但准确率高得多）
+            //
+            // 为什么把视觉放三击：视觉慢，不该是默认动作。但它的准确率
+            // 明显更高 —— 同一批题 OCR 把「第十五个五年」读成「第十五人五年」、
+            // 把「劳动收入」读成「劳动」、漏掉「额」「而当」，视觉全对。
+            // 所以给一个「按三下换准」的选择，赶时间就按两下。
+            if (n >= 3) {
+                XposedBridge.log(TAG + " Vol+ x" + n + " -> vision scan");
+                sendBroadcast("vision");
+            } else {
+                XposedBridge.log(TAG + " Vol+ x" + n + " -> fast scan");
+                sendBroadcast("fast");
+            }
         } };
         postDelayed(upTapDispatch, TAP_WINDOW_MS);
     }

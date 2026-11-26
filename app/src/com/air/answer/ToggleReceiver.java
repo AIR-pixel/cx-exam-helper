@@ -21,6 +21,8 @@ import android.util.Log;
  *   "app"     → 切总开关（Vol- ×3）
  *   "scan"    → 主动识别当前屏一次（Vol- 长按 2s），不改变任何开关状态
  *   "fast"    → 快速识别（Vol+ ×2）：同 scan，但要求服务端走浅思考档
+ *   "vision"  → 视觉模式识别：整屏交给视觉模型，跳过 OCR + 几何恢复
+ *   "vonly"   → 同上，但只走视觉（失败不退回 OCR），用于排查
  */
 public class ToggleReceiver extends BroadcastReceiver {
     private static final String TAG = "AnsToggle";
@@ -56,6 +58,19 @@ public class ToggleReceiver extends BroadcastReceiver {
             // 用户可能这道题想快、下道题想稳，做成全局开关就得来回切配置页。
             Log.d(TAG, "broadcast fast scan");
             ReaderService.forceScanNow(true);
+        } else if ("vision".equals(which) || "vonly".equals(which)) {
+            // 视觉识别：整屏截图交给视觉模型，它自己找题目/选项/题型。
+            //
+            // 为什么要这条：OCR + 几何恢复那条路每遇到新排版就踩坑
+            // （第 7/10/5 题各一个），而视觉模型直接看图没有这些问题。
+            // 实测同一批题，视觉的题干比 OCR 干净得多 —— OCR 把
+            // 「第十五个五年」读成「第十五人五年」、把「劳动收入」读成「劳动」。
+            //
+            // 代价是慢（3~15s vs 1.6~5.7s），所以做成一次性按钮而不是全局默认，
+            // 让用户按需选择：赶时间用 fast，要准用 vision。
+            String mode = "vision".equals(which) ? "first" : "only";
+            Log.d(TAG, "broadcast vision scan mode=" + mode);
+            ReaderService.forceScanNow(true, mode);
         }
     }
 }
