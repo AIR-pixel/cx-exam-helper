@@ -15,15 +15,26 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   getevent/sendevent 也抓不到 —— 事件被 PhoneWindowManager 在 system_server
  *   里消费。只有 hook 这里才能可靠拿到按键。
  *
- * 手势（全部集中在 Vol-，Vol+ 完全放行）：
+ * 手势：
+ *   Vol+ 单击    → 浮层存在时：立即识别当前屏（which=fast，视觉+快模型 4~5s）
+ *                  浮层不存在：完全放行，正常调音量
  *   Vol- 双击    → 广播 ... {which=overlay}  浮层显隐（读题/作答继续）
  *   Vol- 三击    → 广播 ... {which=app}      总开关（读题/浮层全停）
- *   Vol- 按住 2s → 广播 ... {which=scan}     主动识别当前屏一次
- *   单击不拦截（正常调音量），短按窗口 500ms，触发后静默 600ms。
+ *   Vol- 按住 2s → 广播 ... {which=scan}     主动识别当前屏一次（旧入口，保留）
+ *   触发后静默 600ms。
+ *
+ * Vol+ 单击为什么要看浮层状态：
+ *   Vol+ 单击是最常用的调音量动作，无条件拦截会让音量没法加。
+ *   而「浮层开着」= 用户明确在用这个工具，此时 Vol+ 才属于工具；
+ *   浮层关掉 = 工具不在场，Vol+ 就该是普通音量键。
+ *   这个判据自解释，用户不需要记「什么时候按一下有效」。
  *
  * 跨进程：system_server 发显式广播到 com.air.mpprobe，app 端 ToggleReceiver
  *   收到后改内存状态 + 回写 flag 文件（避免 system_server 直接写 app 私有目录
  *   被 SELinux 拒）。
+ *   反方向（app → system_server）走 /data/local/tmp/cx-ovstate 文件：
+ *   app 写、system_server 读。实测 system_server 读 app_data_file 被拒，
+ *   而 shell_data_file 可以。
  *
  * scope 必须包含 "android"（system_server 的包名）。
  */
@@ -33,6 +44,14 @@ public class VolKeyModule implements IXposedHookLoadPackage {
     private static final String TARGET_APP = "com.air.mpprobe";
     private static final String ACTION = "com.air.mpprobe.TOGGLE";
     private static final String SECRET = "cx-helper-2026-toggle";
+
+    /**
+     * app 写来的跨进程状态文件（app 写、system_server 读）。
+     *
+     * 不能用 app 私有目录：system_server 读 app_data_file 会被 SELinux 拒。
+     * /data/local/tmp 是 shell_data_file，system_server 可读、app 可写。
+     */
+    private static final String SHARED_STATE = "/data/local/tmp/cx-ovstate";
 
     /** 触发后静默，防连发 */
     private static final long COOLDOWN_MS = 600;
@@ -195,19 +214,32 @@ public class VolKeyModule implements IXposedHookLoadPackage {
     // ───────────────────────── Vol+ ─────────────────────────
 
     /**
-     * Vol+ 手势：
-     *   双击 → 快速识别（which=fast，服务端走无思考/浅思考档）
-     *   其余 → 原样放行，正常调音量
+     * Vol+ 手势（2026-11-26 改版）：
      *
-     * 为什么单独给它一个手势：
-     *   考试场景下最常用的两种模式是「正常答」和「快点答」。Vol- 长按已经占了
-     *   「主动识别」，Vol- 双击/三击占了浮层显隐和总开关 —— Vol- 再叠手势会让
-     *   用户记不住，而且误触代价高（三击和双击只差一下）。
-     *   把「快」放到另一个键上，两个键各管一类：Vol- 管开关，Vol+ 管速度。
+     *   浮层存在时 单击 → 立即识别当前屏（which=fast，视觉+快模型 4~5s）
+     *   浮层不存在 单击 → 完全放行，正常调音量
      *
-     * 为什么只做双击、不做单击：
-     *   单击 Vol+ 是用户最常用的调音量动作，拦下来会让音量没法加。
-     *   双击天然是个"刻意动作"，不会误触。
+     * 为什么从「双击」改成「单击」：
+     *   air 反馈「主动识题长按太累了」。原来要 Vol- 长按 2 秒，考试时每道题
+     *   都这么按很累。而 Vol+ 单击是最自然的"再来一次"动作。
+     *
+     * 为什么用「浮层是否存在」当开关，而不是无条件拦截：
+     *   无条件拦截会让音量没法加 —— 这是用户最常用的动作，不能占。
+     *   而浮层开着 = 用户明确在用这个工具，此时 Vol+ 才属于工具。
+     *   浮层关掉 = 工具不在场，Vol+ 就该是普通音量键。这个判据是自解释的，
+     *   不需要额外记"什么时候按一下有效"。
+     *
+     * 为什么不做双击/三击了：
+     *   单击已经能触发，多击反而要等 500ms 窗口才能判定，慢。
+     *   视觉现在是默认路径，也不需要单独一个手势切过去。
+     *   保留 n>=1 的判断（而不是 ==1），这样快速连按两下也只触发一次，
+     *   不会因为手抖变成两次请求。
+     *
+     * 音量怎么处理：
+     *   本模块一直是「旁路监听 + 事后回滚」，不拦截事件（拦截要改
+     *   interceptKeyBeforeQueueing 的返回值，各 ROM 行为不一致，风险高）。
+     *   所以按一下音量会 +1，触发后立刻回滚到按下前的值。
+     *   浮层不在时不做回滚 —— 那是用户真的要调音量。
      */
     private static void onVolUp(KeyEvent e, int action, long downTime) {
         long now = System.currentTimeMillis();
@@ -216,8 +248,11 @@ public class VolKeyModule implements IXposedHookLoadPackage {
             int repeat = 0;
             try { repeat = e.getRepeatCount(); } catch (Throwable ignored) {}
             if (repeat == 0) {
-                // 记下当前音量：双击触发后回滚，否则按两下音量已经加了两格
-                if (volUpTapCount == 0) volUpSavedVolume = readMusicVolume();
+                // 记下当前音量：若最终判定为「触发识别」，要回滚掉这次 +1。
+                // 浮层状态在 DOWN 时读一次就够（一次按压内不会变），
+                // 缓存到字段避免 UP 时再读一次文件。
+                volUpSavedVolume = readMusicVolume();
+                volUpOverlayAtDown = isOverlayOn();
             }
             return;
         }
@@ -225,39 +260,71 @@ public class VolKeyModule implements IXposedHookLoadPackage {
         if (now - lastFireUp < COOLDOWN_MS) return;
 
         volUpTapCount++;
-        XposedBridge.log(TAG + " Vol+ tap #" + volUpTapCount);
+        XposedBridge.log(TAG + " Vol+ tap #" + volUpTapCount
+                + " overlay=" + volUpOverlayAtDown);
 
         cancelUpTapDispatch();
+
+        // 浮层存在 → 立即触发，不等点击窗口。
+        // 不等的原因：单击就是最终意图，没有"可能要按第二下"的歧义了。
+        // 等 500ms 会让用户觉得按了没反应。
+        if (volUpOverlayAtDown) {
+            volUpTapCount = 0;
+            lastFireUp = now;
+            restoreVolUpVolume();
+            vibrate();
+            XposedBridge.log(TAG + " Vol+ single (overlay on) -> fast scan");
+            sendBroadcast("fast");
+            return;
+        }
+
+        // 浮层不存在 → 放行，让音量正常变化。
+        // 仍走一次延迟派发，把计数器清干净，避免残留计数影响下一次判定。
         final int expected = volUpTapCount;
         upTapDispatch = new Runnable() { public void run() {
             upTapDispatch = null;
-            int n = volUpTapCount;
+            if (volUpTapCount != expected) return;
             volUpTapCount = 0;
-            if (n != expected) return;
-            if (n < 2) {
-                // 单击：不拦截，系统已经调过音量了
-                return;
-            }
-            lastFireUp = System.currentTimeMillis();
-            // 双击及以上：把音量还原，用户不该因为按了快捷键而被改音量
-            restoreVolUpVolume();
-            vibrate();
-            // Vol+ ×2 = 快速识别（浅思考，1~2s）
-            // Vol+ ×3 = 视觉识别（整屏交给视觉模型，3~15s，但准确率高得多）
-            //
-            // 为什么把视觉放三击：视觉慢，不该是默认动作。但它的准确率
-            // 明显更高 —— 同一批题 OCR 把「第十五个五年」读成「第十五人五年」、
-            // 把「劳动收入」读成「劳动」、漏掉「额」「而当」，视觉全对。
-            // 所以给一个「按三下换准」的选择，赶时间就按两下。
-            if (n >= 3) {
-                XposedBridge.log(TAG + " Vol+ x" + n + " -> vision scan");
-                sendBroadcast("vision");
-            } else {
-                XposedBridge.log(TAG + " Vol+ x" + n + " -> fast scan");
-                sendBroadcast("fast");
-            }
+            // 不拦截、不回滚 —— 用户就是要调音量
         } };
         postDelayed(upTapDispatch, TAP_WINDOW_MS);
+    }
+
+    /** DOWN 时缓存的浮层状态（同一次按压内不变） */
+    private static volatile boolean volUpOverlayAtDown = false;
+
+    /**
+     * 读 app 写来的浮层状态。
+     *
+     * 为什么要绕这一圈：本模块跑在 system_server（uid 1000 / SELinux
+     * system_server），读不了 app 私有目录。实测：
+     *   system 读 /data/data/com.air.mpprobe/files/overlay.flag → Permission denied
+     * 而 /data/local/tmp 是 shell_data_file 标签，system_server 可读，
+     * app 也可写（目录 0777）。所以 app 把状态写在那儿（见 ToggleStore
+     * .writeSharedState），这里读。
+     *
+     * 读不到时返回 false（保守：宁可让 Vol+ 当普通音量键，也不要误拦）。
+     */
+    private static boolean isOverlayOn() {
+        try {
+            java.io.File f = new java.io.File(SHARED_STATE);
+            if (!f.exists()) return false;
+            // 文件很小（几十字节），直接读
+            byte[] buf = new byte[256];
+            int n;
+            java.io.FileInputStream fis = new java.io.FileInputStream(f);
+            try { n = fis.read(buf); } finally { fis.close(); }
+            if (n <= 0) return false;
+            String s = new String(buf, 0, n, "UTF-8");
+            // 解析 "overlay=1\napp=1"
+            int i = s.indexOf("overlay=");
+            if (i < 0) return false;
+            int p = i + "overlay=".length();
+            return p < s.length() && s.charAt(p) == '1';
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " read state err: " + t);
+            return false;
+        }
     }
 
     /** Vol+ 短按计数器 */

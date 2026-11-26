@@ -92,13 +92,38 @@ if errorlevel 1 (
 
 where adb >nul 2>nul
 if errorlevel 1 (
-  echo [6/6] WARN: adb not found, skip USB forward
+  echo [6/7] WARN: adb not found, skip USB forward
 ) else (
   adb reverse tcp:18888 tcp:18888 >nul 2>nul
   if errorlevel 1 (
-    echo [6/6] WARN: adb reverse failed
+    echo [6/7] WARN: adb reverse failed
   ) else (
-    echo [6/6] USB forward ready tcp:18888
+    echo [6/7] USB forward ready tcp:18888
+  )
+)
+
+rem ── [7/7] 准备跨进程状态文件 ──
+rem
+rem Vol+ 单击要判断「浮层是否存在」才决定触发识别还是调音量。
+rem 判断在 Xposed 模块（system_server）里做，而它读不了 app 私有目录
+rem （SELinux app_data_file 拒绝）。所以 app 把状态写到 /data/local/tmp，
+rem 那里是 shell_data_file，system_server 可读。
+rem
+rem 但 /data/local/tmp 目录本身是 drwxrwx--x（只有 shell 能写），
+rem app 的 uid 不在其中 —— 直接创建文件会 EACCES。
+rem 实测：预创建 + chmod 666 之后 app 就能写入（已存在的文件权限够即可）。
+rem
+rem 所以每次启动都确保这个文件存在且 666。app 无 root 做不到，
+rem 必须在这里用 adb shell su 代劳。
+rem
+rem 幂等：文件已存在时 chmod 一下就行，不会破坏当前状态。
+where adb >nul 2>nul
+if not errorlevel 1 (
+  adb shell "su -c 'test -f /data/local/tmp/cx-ovstate || echo overlay=1 > /data/local/tmp/cx-ovstate; chmod 666 /data/local/tmp/cx-ovstate'" >nul 2>nul
+  if errorlevel 1 (
+    echo [7/7] WARN: state file prep failed ^(Vol+ single may not work^)
+  ) else (
+    echo [7/7] Vol+ state file ready
   )
 )
 

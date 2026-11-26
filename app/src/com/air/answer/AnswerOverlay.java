@@ -50,7 +50,7 @@ public final class AnswerOverlay {
     /** 空态答案区最小高度（dp）：保证浮层挂上时是一块看得见的实体，不是一条线 */
     private static final int EMPTY_MIN_H = 56;
     /** 空态提示文案：自解释，用户一眼看出「在，只是还没读到题」 */
-    private static final String EMPTY_HINT = "等待读题…\n长按音量减 2 秒立即识别";
+    private static final String EMPTY_HINT = "等待读题…\n音量加按一下立即识别";
 
     // 自动滚动参数：浮层 NOT_TOUCHABLE，用户拖不了，超长答案只能自己滚
     private static final int SCROLL_TICK_MS = 16;      // ~60fps

@@ -301,7 +301,7 @@ public class ReaderService extends AccessibilityService {
         };
         Bus.setListener(busListener);
         if (ToggleStore.appOn() && ToggleStore.overlayOn()) overlay.show();
-        Bus.publishStatus("a11y 已连接 · Vol-×2 弹窗 / Vol-×3 总开关 / 长按识别", "ready");
+        Bus.publishStatus("a11y 已连接 · 音量加按一下识别 / Vol-×2 弹窗 / Vol-×3 总开关", "ready");
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {
@@ -1022,6 +1022,19 @@ public class ReaderService extends AccessibilityService {
                 // 服务端判定为非题目（题干清洗后只剩页面装饰）：不糊叠层、不占去重位
                 if ("none".equals(a.source)) {
                     Log.d(TAG, "server says not a question, drop (kept last=" + lastScreenHash + ")");
+                    // force 时把答案区清掉。
+                    //
+                    // 为什么：用户按 Vol+ 明确要求「读这一屏」，服务端判定
+                    // 这里没题目 —— 那么浮层上还挂着上一题的答案就是误导
+                    // （实测：换到桌面后按 Vol+，浮层还显示上一题的答案，
+                    // 看起来像"这题答案是它"）。主动识别就该给出这一屏的真实结果。
+                    //
+                    // 非 force（自动轮询）不清：轮询会在题目页和过渡页之间
+                    // 反复跳，清来清去会让浮层闪。
+                    if (force) {
+                        lastScreenHash = "";
+                        Bus.publishV2("", "", "none", "", 0);
+                    }
                     Bus.publishStatus(a.text == null || a.text.isEmpty()
                             ? "未识别到题目" : a.text, "off");
                     return;

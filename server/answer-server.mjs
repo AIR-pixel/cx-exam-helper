@@ -362,6 +362,27 @@ function parseVisionFull(raw) {
   indices = indices.map(Number).filter((n) => Number.isInteger(n) && n >= 0 && n < 26);
 
   if (!stem) return { ok: false, reason: '视觉没读出题干' };
+
+  // ── 题目页校验（必须在选项/下标校验之前）──
+  //
+  // 视觉主路径绕过了 OCR 路径的 structured.ok 闸门，意味着「这一屏是不是
+  // 题目页」没人管了。实测踩到：zygote 重启后回到桌面，Vol+ 单击触发的
+  // 识别把桌面天气组件当成题目，浮层贴出一大段天气 JSON
+  // （{"天气":{"地区":"鹿邑县",...}}），还标着 "AI · unknown"。
+  //
+  // 视觉模型被要求「返回 stem/options/indices」，它遇到非题目页也会硬凑：
+  // 把桌面图标当选项、把组件文字当题干。
+  //
+  // 顺序很重要：先判题目页，再判选项数。反过来的话，非题目页通常只凑出
+  // 0~1 个选项，会先命中「选项不足」然后退回 OCR —— 而 OCR 读同一张图
+  // 照样能凑出垃圾，最后还是答一段没意义的内容。
+  const QUESTION_MARK = /[?？]/;
+  const QUESTION_VERB = /(下列|以下|如下|哪一?个|哪些|哪项|什么|怎样|如何|是否|属于|正确|错误|符合|不属于|包括|指的是|正确的是|错误的是|请选择|单选|多选|判断|填空)/;
+  const looksLikeQuestion = QUESTION_MARK.test(stem) || QUESTION_VERB.test(stem);
+  if (!looksLikeQuestion) {
+    return { ok: false, notQuestion: true, reason: `不像题目页（题干：${stem.slice(0, 30)}）` };
+  }
+
   if (options.length < 2) return { ok: false, reason: `视觉只读到 ${options.length} 个选项` };
   if (!indices.length) return { ok: false, reason: '视觉没给出答案下标' };
 
@@ -873,6 +894,30 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
 
   const q = structured.primary;
 
+  // force 兜底路径也要判「像不像题目」。
+  //
+  // force 的设计是「用户明确要求读这一屏，跳过闸门」—— 因为陌生 App
+  // 没有 交卷/下一题 这些文案，闸门必然不过。但这不等于「什么都答」：
+  // 实测踩到在微信聊天列表/桌面按 Vol+，OCR 把列表项凑成题干+选项，
+  // 模型硬答出一个 JSON（{"应用":"微信","当前页面":"通讯录"}）。
+  //
+  // 判据比视觉那边宽 —— force 是用户主动要求的，宁可多答一点，
+  // 只挡住明显不是题目的（没有任何疑问词/题型动词 + 选项也不像）。
+  if (structured.forced) {
+    const stem = String(q.stem || '');
+    const looksQ = /[?？]/.test(stem)
+      || /(下列|以下|如下|哪一?个|哪些|哪项|什么|怎样|如何|是否|属于|正确|错误|符合|不属于|包括|指的是|请选择|单选|多选|判断|填空|选择)/.test(stem);
+    if (!looksQ) {
+      console.log(`[none] force 但题干不像题目："${stem.slice(0, 40)}"`);
+      return {
+        answer: '这一屏没有题目',
+        source: 'none',
+        question: null,
+        structured,
+      };
+    }
+  }
+
   // 选项不全时不要问模型。
   //
   // 真机实测（m.topnews.cn 微信 WebView）：C 选项的「C.」前缀被 WebView 拆成
@@ -1306,12 +1351,14 @@ const server = http.createServer(async (req, res) => {
           // （C/D 丢了），直接答不了；而视觉重试一次通常就对了（模型偶尔会
           // 返回带解释的文本而不是纯 JSON）。多花 5s 换一个能用的答案，
           // 比立刻退回一条注定失败的路径划算。
-          if (!v.ok) {
+          //
+          // 但「不像题目页」不重试 —— 那是明确的否定结论，同一张图重看一次
+          // 还是同样的结论，白花 5s。
+          if (!v.ok && !v.notQuestion) {
             console.warn(`[vision-first] 第一次解析失败（${v.reason}），重试一次`);
             vraw = await engineQoderVisionFull(image, fast);
             v = parseVisionFull(vraw);
           }
-
           if (v.ok) {
             const vq = {
               stem: v.stem,
@@ -1347,6 +1394,24 @@ const server = http.createServer(async (req, res) => {
               });
             }
             console.warn('[vision-first] 渲染空答案，退回 OCR 路径');
+          } else if (v.notQuestion) {
+            // 视觉明确判定「这不是题目页」→ 直接回 none，不要再退回 OCR。
+            //
+            // 为什么不能退回：OCR 读的是同一张图，桌面/聊天列表的文字
+            // 照样能凑出「题干+选项」，最后还是会答一段垃圾。实测踩到
+            // 桌面天气组件被当成题目、浮层贴出整段天气 JSON。
+            // 视觉模型看图比 OCR 文本更可靠地判断「这里有没有题」，它的
+            // 否定结论应当直接采信。
+            console.log(`[vision-first] 判定非题目页：${v.reason}`);
+            return json(res, {
+              answer: '这一屏没有题目',
+              source: 'none',
+              type: null,
+              question: null,
+              screenHash: '',
+              stableKey: '',
+              ms: Date.now() - t0,
+            });
           } else {
             console.warn(`[vision-first] 不可用：${v.reason}，退回 OCR 路径`);
           }
@@ -1355,6 +1420,10 @@ const server = http.createServer(async (req, res) => {
         }
         // only 模式不退回 OCR —— 用户明确要求只走视觉，退回会让人分不清
         // 到底是哪条路径出的结果。直接报错，信息更明确。
+        //
+        // 但「非题目页」不是失败，是正常结论 —— 这条必须在 only 分支之前
+        // 处理掉（上面 v.notQuestion 那个分支），否则 only 模式会把
+        // 「这一屏没题目」误报成「视觉识别失败」。
         if (visionMode === 'only') {
           return json(res, {
             answer: '视觉识别失败（VISION_MODE=only，未退回 OCR）',

@@ -297,20 +297,20 @@ t('视觉：正常 JSON 解析', () => {
 t('视觉：选项带 "A." 前缀要剥掉', () => {
   // 模型偶尔不听话，把编号写进选项原文
   const r = parseVisionFull(JSON.stringify({
-    type: 'single', stem: '题', options: ['A. 甲', 'B、乙', '(C) 丙', 'D．丁'], indices: [2],
+    type: 'single', stem: '下列说法正确的是', options: ['A. 甲', 'B、乙', '(C) 丙', 'D．丁'], indices: [2],
   }));
   assert.equal(r.ok, true);
   assert.deepEqual(r.options, ['甲', '乙', '丙', '丁']);
 });
 
 t('视觉：```json 围栏能剥', () => {
-  const r = parseVisionFull('```json\n{"type":"single","stem":"题","options":["a","b"],"indices":[1]}\n```');
+  const r = parseVisionFull('```json\n{"type":"single","stem":"下列说法正确的是","options":["a","b"],"indices":[1]}\n```');
   assert.equal(r.ok, true);
   assert.deepEqual(r.indices, [1]);
 });
 
 t('视觉：前后有废话也能抠出 JSON', () => {
-  const r = parseVisionFull('好的，答案是：{"type":"single","stem":"题","options":["a","b"],"indices":[0]} 以上。');
+  const r = parseVisionFull('好的，答案是：{"type":"single","stem":"下列说法正确的是","options":["a","b"],"indices":[0]} 以上。');
   assert.equal(r.ok, true);
   assert.equal(r.type, 'single');
 });
@@ -318,7 +318,7 @@ t('视觉：前后有废话也能抠出 JSON', () => {
 t('视觉：判单选却给多个下标 → 改判多选', () => {
   // 同 parseAnswerText 的规则：以 indices 为准
   const r = parseVisionFull(JSON.stringify({
-    type: 'single', stem: '题', options: ['a', 'b', 'c'], indices: [0, 2],
+    type: 'single', stem: '下列说法正确的是', options: ['a', 'b', 'c'], indices: [0, 2],
   }));
   assert.equal(r.ok, true);
   assert.equal(r.type, 'multi', '多下标必须改判多选，不能砍成一个');
@@ -332,20 +332,20 @@ t('视觉：没读出题干要拒绝', () => {
 });
 
 t('视觉：选项不足 2 个要拒绝', () => {
-  const r = parseVisionFull(JSON.stringify({ type: 'single', stem: '题', options: ['只有一个'], indices: [0] }));
+  const r = parseVisionFull(JSON.stringify({ type: 'single', stem: '下列说法正确的是', options: ['只有一个'], indices: [0] }));
   assert.equal(r.ok, false);
   assert.match(r.reason, /选项/);
 });
 
 t('视觉：没给下标要拒绝（不能瞎猜）', () => {
-  const r = parseVisionFull(JSON.stringify({ type: 'single', stem: '题', options: ['a', 'b'] }));
+  const r = parseVisionFull(JSON.stringify({ type: 'single', stem: '下列说法正确的是', options: ['a', 'b'] }));
   assert.equal(r.ok, false);
   assert.match(r.reason, /下标/);
 });
 
 t('视觉：非法下标被过滤', () => {
   const r = parseVisionFull(JSON.stringify({
-    type: 'multi', stem: '题', options: ['a', 'b', 'c'], indices: [0, -1, 99, 'x', 2],
+    type: 'multi', stem: '下列说法正确的是', options: ['a', 'b', 'c'], indices: [0, -1, 99, 'x', 2],
   }));
   assert.equal(r.ok, true);
   assert.deepEqual(r.indices, [0, 2], '负数/越界/非数字都要丢掉');
@@ -412,6 +412,73 @@ t('fast 档走视觉时用快模型', () => {
   const seg = src.slice(i, i + 2200);
   assert.ok(seg.includes('QODER_FAST_MODEL'), 'fast 档必须能换快模型');
   assert.ok(seg.includes('reasoningEffort'), 'fast 档必须能降思考深度');
+});
+
+console.log('\n=== 14. 非题目页必须拒绝（真机踩到）===');
+// 真机踩到：zygote 重启后回到桌面，Vol+ 单击触发的识别把桌面天气组件
+// 当成题目，浮层贴出一大段天气 JSON（{"天气":{"地区":"鹿邑县",...}}），
+// 还标着 "AI · unknown"。视觉主路径绕过了 OCR 路径的 structured.ok 闸门，
+// 「这一屏是不是题目页」就没人管了。
+
+t('视觉：桌面内容判为非题目页', () => {
+  const r = parseVisionFull(JSON.stringify({
+    type: 'single',
+    stem: '{"天气":{"地区":"鹿邑县","当前状况":"晴","当前温度":"18℃"}}',
+    options: ['天气', '日历'],
+    indices: [0],
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.notQuestion, true, '必须带 notQuestion 标记，下游据此直接回 none');
+});
+
+t('视觉：微信聊天列表判为非题目页', () => {
+  const r = parseVisionFull(JSON.stringify({
+    type: 'single',
+    stem: '微信 公众号 服务通知 微信团队',
+    options: ['通讯录', '发现'],
+    indices: [0],
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.notQuestion, true);
+});
+
+t('视觉：题目页不能被误判', () => {
+  // 各种题型都要能过闸门
+  const cases = [
+    '党的二十届五中全会审议通过了哪一文件？（ ）',
+    '该酒店可能违反的义务包括？',
+    '（多选）关于校园欺凌的防范与处置，下列说法正确的有（ ）。',
+    '下列说法正确的是',
+    '请选择正确答案',
+    '下列哪个选项符合题意',
+  ];
+  for (const stem of cases) {
+    const r = parseVisionFull(JSON.stringify({
+      type: 'single', stem, options: ['甲', '乙'], indices: [0],
+    }));
+    assert.equal(r.ok, true, `误判了：${stem}`);
+  }
+});
+
+t('非题目页判定在选项校验之前', () => {
+  // 顺序很关键：非题目页通常只凑出 0~1 个选项，如果先判选项数，
+  // 会命中「选项不足」然后退回 OCR —— 而 OCR 读同一张图照样凑垃圾。
+  const i = src.indexOf('notQuestion: true');
+  const j = src.indexOf('视觉只读到');
+  assert.ok(i > 0 && j > 0);
+  assert.ok(i < j, 'notQuestion 判定必须早于「选项不足」判定');
+});
+
+t('非题目页不重试', () => {
+  // 同一张图重看一次还是同样的结论，白花 5s
+  assert.ok(src.includes('!v.notQuestion'), '重试条件必须排除 notQuestion');
+});
+
+t('非题目页直接回 none，不退回 OCR', () => {
+  const i = src.indexOf('} else if (v.notQuestion)');
+  assert.ok(i > 0, '必须有 notQuestion 的专门分支');
+  const seg = src.slice(i, i + 500);
+  assert.ok(seg.includes("source: 'none'"), '必须直接回 none');
 });
 
 console.log('\n' + '='.repeat(56));

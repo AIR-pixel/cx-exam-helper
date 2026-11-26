@@ -32,6 +32,14 @@ public final class ToggleStore {
     private static final String K_TREEDUMP = "treeDumpOn";
     private static final String FLAG_DIR = "/data/data/com.air.mpprobe/files";
 
+    /**
+     * 跨进程共享状态文件（app 写、system_server 读）。
+     *
+     * 放 /data/local/tmp 而不是 app 私有目录：app_data_file 的 SELinux 标签
+     * 让 system_server 读不了，而 shell_data_file 可以。
+     */
+    private static final String SHARED_STATE = "/data/local/tmp/cx-ovstate";
+
     private static SharedPreferences sp;
     private static volatile boolean overlayOn = true;
     private static volatile boolean appOn = true;
@@ -93,6 +101,42 @@ public final class ToggleStore {
         writeFlag("overlay.flag", overlayOn);
         writeFlag("app.flag", appOn);
         writeFlag("treedump.flag", treeDumpOn);
+        writeSharedState();
+    }
+
+    /**
+     * 把状态写到 /data/local/tmp，给 Xposed 模块（system_server）读。
+     *
+     * 为什么需要这个：Vol+ 单击要变成「浮层存在时才触发识别，否则正常调音量」。
+     * 判断浮层在不在，只能靠 Xposed 模块读状态 —— 但它跑在 system_server
+     * （uid 1000 / SELinux system_server），读不了 app 私有目录。
+     * 实测：
+     *   system 读 /data/data/com.air.mpprobe/files/overlay.flag → Permission denied
+     *   system 写 /data/local/tmp/xxx                       → Permission denied
+     *   app    写 /data/local/tmp/xxx                       → OK
+     *   system 读 /data/local/tmp/xxx                       → OK
+     *
+     * 所以方向是「app 写、system_server 读」。/data/local/tmp 是 0777 且
+     * SELinux 为 shell_data_file，system_server 域对它可读。
+     *
+     * 内容用简单 key=value，避免 JSON 解析（Xposed 侧不想引入依赖）：
+     *   overlay=1
+     *   app=1
+     */
+    private static void writeSharedState() {
+        try {
+            File f = new File(SHARED_STATE);
+            // 先用 shell 可写的目录；文件不存在时 app 有权限创建（目录 0777）
+            try (FileOutputStream fos = new FileOutputStream(f, false)) {
+                String s = "overlay=" + (overlayOn ? "1" : "0")
+                        + "\napp=" + (appOn ? "1" : "0") + "\n";
+                fos.write(s.getBytes(StandardCharsets.UTF_8));
+            }
+            // 权限放开，确保 system_server 能读（不同 ROM 的 umask 不一样）
+            try { f.setReadable(true, false); } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.w(TAG, "writeSharedState failed: " + t.getMessage());
+        }
     }
 
     private static Boolean readFlag(String name) {
