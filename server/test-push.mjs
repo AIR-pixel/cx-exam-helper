@@ -11,12 +11,17 @@
  *   - 队列上限（防止无限增长）
  *   - 断开连接的 waiter 不能泄漏
  *
- * 需要真实服务在跑（默认 10.75.124.158:18888，可用 PUSH_TEST_BASE 覆盖）。
+ * 需要真实服务在跑（默认 127.0.0.1:18888，可用 PUSH_TEST_BASE 覆盖）。
  * 没有服务时整段跳过，不算失败 —— 这是集成测试，不是单元测试。
+ *
+ * 为什么默认值从 10.75.124.158 改成 127.0.0.1：
+ *   那个 IP 是某次 PC 热点分配的地址，换个网络就变了（DHCP）。写死在测试里
+ *   会让「服务明明在跑，测试却报服务未运行」——2026-11-26 就踩到，当时
+ *   实际地址已是 10.11.42.158。测本机服务用 loopback 永远正确。
  */
 import assert from 'node:assert/strict';
 
-const BASE = process.env.PUSH_TEST_BASE || 'http://10.75.124.158:18888';
+const BASE = process.env.PUSH_TEST_BASE || 'http://127.0.0.1:18888';
 
 let pass = 0, fail = 0, skip = 0;
 const t = async (name, fn) => {

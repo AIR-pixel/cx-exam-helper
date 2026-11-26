@@ -472,10 +472,54 @@ export function recoverOptionsByGeometry(boxes) {
     if (idx >= 0) {
       out[idx].text = `${o.key}. ${String(out[idx].text).trim()}`;
       out[idx].recovered = true;
+      // 记住标签自己的 x：下游算缩进基准时必须用标签位置，
+      // 不能用正文位置（正文比标签右移 55~70px，用它当基准会让
+      // 同缩进的漏标签行看起来"没缩进"，第 10 题 C 就是这么丢的）。
+      out[idx].labelX = o.box.x;
       dropped.add(o.i);
     }
   }
   if (dropped.size) out = out.filter((_, i) => !dropped.has(i));
+
+  // ══════════ 第一遍半：按坐标裁掉顶部状态栏/标题栏 ══════════
+  //
+  // 为什么必须放在「裸标签贴回」之后：裁剪要靠「第一个选项行的 y」定界，
+  // 而裸标签没贴回之前，matchOption("A.") 返回 null（标签后无正文），
+  // labeled 是空数组 —— 放在前面会因为没有锚点而整段跳过（实测踩到）。
+  //
+  // 为什么要按坐标裁：isOcrUiNoise 是按**文本内容**过滤的正则黑名单，只能
+  // 挡住 "9:30"、"KB/s" 这类固定格式。状态栏的信号格数、通知图标、网页标题、
+  // 域名都读得出字但内容千变万化，黑名单挡不住。第 10 题实测混进题干的：
+  //   "2台"、"河南省第四届"豫见法治"青少年学法.."、"m.topnews.cn"、"① 00:23"
+  // 模型看到的是「2台 河南省…m.topnews.cn ① 00:23 答题进度 党的二十届…」
+  //
+  // 判据（三个都满足才删，避免误杀真题干）：
+  //   1. 在第一个选项上方
+  //   2. 离第一个选项超过 1.5 倍行高 —— 真题干紧贴选项，不会隔这么远
+  //   3. 落在「标题栏」区域内
+  //
+  // 关于第 3 条的边界怎么定：不能用 maxY2 × 0.2 估屏高。
+  // maxY2 是「最下面那个文字框」，这题是按钮 y2=1675，而真屏高 2400 ——
+  // 1675×0.2=335，进度条在 y=357 就「掉出顶部区」被当成题干留下了
+  // （实测：题干里混进 "① 00:23 答题进度"）。
+  //
+  // 改成从**第一个选项**反推：标题栏/进度条一定在「第一个选项上方一整段」，
+  // 而真题干就在选项正上方。用「第一个选项到它上方第一行的距离」当行高，
+  // 再乘以一个宽裕的倍数（3 倍）当分界 —— 真题干两行约 120px，
+  // 3 倍行高约 290px，标题栏在 750-357=393px 之外，正好被切掉。
+  const preLabeled = out.filter((b) => matchOption(b.text));
+  if (preLabeled.length >= 2) {
+    const firstOptY = Math.min(...preLabeled.map((b) => b.y));
+    const gaps = [];
+    const sortedY = [...new Set(preLabeled.map((b) => b.y))].sort((a, b) => a - b);
+    for (let k = 1; k < sortedY.length; k++) gaps.push(sortedY[k] - sortedY[k - 1]);
+    const optGap = gaps.length ? Math.min(...gaps) : 140;
+    // 单行高 ≈ 选项间距的一半（选项之间夹着一行正文折行）
+    const rowH = Math.max(50, optGap / 2);
+    // 第一个选项往上，超过 3 个行高的都判为标题栏/进度条
+    const cutLine = firstOptY - rowH * 3;
+    out = out.filter((b) => b.y >= cutLine);
+  }
 
   // 只处理「有选项标签」的行：先算出正常选项的正文左边界基准
   const labeled = out.filter((b) => matchOption(b.text));
@@ -484,8 +528,25 @@ export function recoverOptionsByGeometry(boxes) {
   // 基准左边界只能从「带标签的选项行」算 —— 不能从全屏最小值算。
   // 题干行通常贴着左边界（实测 x=95/96），比选项正文（x=126）更靠左，
   // 用它当基准会让所有选项正文都显得"没缩进"，恢复彻底失效。
-  // 取已标注选项 x 的最小值即可：漏标签的行一定是缩进的，不会拉低基准。
-  const baseX = Math.min(...labeled.map((b) => b.x));
+  //
+  // 关键：取的是**标签所在的 x**，不是选项行的 x。
+  //
+  // 第 10 题踩到的坑（2026-11-26，单选题「二十届五中全会」）：
+  //   版式是「正文在左、标签在正文右侧下方」，OCR 框这样：
+  //     正文1 y=750 x=194   标签 A. y=779 x=126
+  //     正文2 y=806 x=183
+  //     正文1 y=944 x=194   标签 B. y=971 x=125
+  //   A/B/D 的标签都是**裸标签**（框里只有 "A."），第一遍把它们贴回正文行时
+  //   只在 text 前面加了 "A. "，box.x 仍是正文的 194。
+  //   于是 baseX = min(194, 194, 196) = 194，而 C 的两行正文 x=196/183，
+  //   196-194=2 < 24，全被判成"没缩进"跳过 —— C 永远补不回来，只剩 2 个选项。
+  //
+  //   修法：baseX 取「标签的 x」。裸标签贴回时把标签的 x 记到 b.labelX 上，
+  //   这里优先用它。没有 labelX（标签本来就长在正文行里）才退回 b.x。
+  //   这样 baseX=125，C 的正文 196-125=71 > 24，正确识别为缩进。
+  const baseX = Math.min(
+    ...labeled.map((b) => (Number.isFinite(b.labelX) ? b.labelX : b.x)),
+  );
 
   // 相邻选项的典型行距：取相邻已标注行 y 差的**最小值**。
   // 不能取中位数/平均值 —— 漏标签只会让间距变大，不会变小：
