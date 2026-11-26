@@ -40,7 +40,18 @@ const NODE_BIN = process.execPath; // 用同一个 node 跑子进程，避免 PA
 const DEFAULT_CONFIG = {
   engine: 'auto',           // auto | qoder | openai | heuristic | echo
   port: SERVER_PORT,
-  bind: '127.0.0.1',        // 127.0.0.1=仅本机USB；0.0.0.0=接受局域网/Tailscale 无线连接
+  // 默认 0.0.0.0 而不是 127.0.0.1。
+  //
+  // 原来的默认值 127.0.0.1 只在「手机插 USB + adb reverse」时能用，一旦用户
+  // 拔线走 WiFi 就全部连接失败 —— 而 manager 会把这份默认值直接传给子进程的
+  // ANSWER_BIND，连 server/config.json 里写的 0.0.0.0 都被覆盖掉。结果就是
+  // 配置文件看着对、行为却是仅本机（2026-11-26 踩到：电脑重启后手机一直
+  // 显示连接失败，config.json 明明写着 "bind": "0.0.0.0"）。
+  //
+  // 安全性说明：answer-server 本来就没有鉴权，绑 127.0.0.1 也不构成保护
+  // （adb reverse 一开，手机侧照样能访问）。既然保护不了，就别为了它牺牲
+  // 可用性。真要收紧，应该加 token 而不是改绑定地址。
+  bind: '0.0.0.0',
   // DSH / qoder
   qoderModel: 'dfmodel',
   qoderPat: '',             // 留空 = 用 ~/.dsh/.qoder-accounts.cn.json

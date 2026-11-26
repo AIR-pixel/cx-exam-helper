@@ -66,6 +66,16 @@ if errorlevel 1 (
 )
 echo     manager OK
 
+rem --- 强制把 bind 校正成 0.0.0.0 ---------------------------------------
+rem manager 的内存配置可能还留着旧值（磁盘改了它不重读），启动出来的
+rem answer-server 就只绑 127.0.0.1，手机走 WiFi 必然「连接失败」。
+rem 2026-11-26 踩到：config.json 写着 0.0.0.0，实际监听却是 127.0.0.1。
+rem 这里每次启动都幂等地推一次，保证配置和运行状态一致。
+powershell -NoProfile -Command ^
+  "try{$c=Invoke-RestMethod 'http://127.0.0.1:18889/api/config' -TimeoutSec 3;" ^
+  "if($c.bind -ne '0.0.0.0'){Invoke-RestMethod 'http://127.0.0.1:18889/api/config' -Method Post -Body (@{bind='0.0.0.0'}|ConvertTo-Json) -ContentType 'application/json' -TimeoutSec 5|Out-Null; Write-Host '    bind corrected to 0.0.0.0'}" ^
+  "}catch{}" 2>nul
+
 rem --- answer service: skip POST /api/start if already listening ---
 powershell -NoProfile -Command "try{(Invoke-RestMethod 'http://127.0.0.1:18888/health' -TimeoutSec 2)|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
 if errorlevel 1 (
@@ -98,11 +108,21 @@ echo   manager   http://127.0.0.1:18889
 echo   answer    http://127.0.0.1:18888/health
 echo   ocr       http://127.0.0.1:18890/health
 echo ------------------------------------------------------------
-echo   phone via USB  -^>  127.0.0.1:18888
-echo   phone via WiFi -^>  LAN_IP:18888
+rem 直接打印手机该填的完整 URL。以前只写 "LAN_IP:18888"，用户还得
+rem 自己去 IP 列表里挑一个 —— 而列表里混着 Tailscale/虚拟网卡的
+rem 169.254.x，挑错就是「连接失败」（2026-11-26 踩到：手机 endpoint
+rem 被填成 169.254.83.107，那是 Tailscale 地址，根本不通）。
+rem 只挑真实的私有网段（10./172.16-31./192.168.），Tailscale 的
+rem 100.64-127 和链路本地 169.254 一律排除。
+echo   phone endpoint (copy this into the app):
+powershell -NoProfile -Command ^
+  "$ips = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {" ^
+  "  $_.IPAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' -and" ^
+  "  $_.InterfaceAlias -notmatch 'Tailscale|Loopback|vEthernet'" ^
+  "} | Sort-Object -Property {$_.InterfaceAlias -eq 'WLAN'} -Descending;" ^
+  "if($ips){$ips | ForEach-Object {Write-Host ('      http://' + $_.IPAddress + ':18888/answer   [' + $_.InterfaceAlias + ']')}}else{Write-Host '      (no LAN IP found - check WiFi)'}"
 echo ------------------------------------------------------------
-echo   local IPv4:
-powershell -NoProfile -Command "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*'} | ForEach-Object {Write-Host ('      ' + $_.IPAddress + '  ' + $_.InterfaceAlias)}"
+echo   phone via USB  -^>  http://127.0.0.1:18888/answer  (needs adb reverse)
 echo ============================================================
 echo.
 echo Close the manager window to stop the answer service.
