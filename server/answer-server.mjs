@@ -134,10 +134,26 @@ function buildMessages(q) {
     .map((o, i) => `${String.fromCharCode(65 + i)}. ${o.text}`)
     .join('\n');
 
+  // 题型兜底：让模型在「按题目本身看更像多选」时能自己纠正。
+  //
+  // 为什么需要：题型是靠 detectType 从 OCR 文本猜的（找"多选题"标签、
+  // "包括哪些"这类线索）。OCR 漏字、版式特殊、题干被裁都会让它猜错，
+  // 而 typeHint 是硬约束 —— 猜成单选，模型就只能输出 {"index":N}，
+  // 多选题直接被答成单选（air 反馈「经常检测不出来是多选」）。
+  //
+  // 所以给模型一个逃生口：如果按题干语义答案明显不止一个，可以返回
+  // {"indices":[...]}，服务端会据此把题型纠正为 multi。
+  // 只在单选/多选之间放行 —— 判断/填空/简答的格式完全不同，不能混。
+  const canSwitch = q.type === 'single' || q.type === 'multi';
+  const switchNote = canSwitch
+    ? '\n注意：如果按题干语义正确答案明显不止一个（如「包括哪些」「正确的有」），'
+      + '请改输出 {"indices":[序号,...]}；只有一个答案时输出 {"index":序号}。'
+    : '';
+
   return [
     {
       role: 'system',
-      content: `你是答题助手，回答中国高校在线课程的客观题。\n${typeHint}\n只输出 JSON，不要解释、不要复述题目、不要 markdown 代码块。`,
+      content: `你是答题助手，回答中国高校在线课程的客观题。\n${typeHint}${switchNote}\n只输出 JSON，不要解释、不要复述题目、不要 markdown 代码块。`,
     },
     { role: 'user', content: optText ? `${q.stem}\n\n${optText}` : String(q.stem || '') },
   ];
@@ -826,6 +842,13 @@ async function solve(text, preStructured, ocrText = '', force = false, imageForV
 
   // 3. 归一化
   const normalized = parseAnswerText(raw, q);
+  // 模型自我纠正了题型（单选位置上返回了多个下标 → 判为多选）：
+  // 把 q.type 一起改掉，否则下游 renderAnswer / 缓存 / 浮层标签
+  // 还按单选显示，用户看到「单选」却有两个答案，会以为程序坏了。
+  if (normalized.typeCorrected) {
+    console.log(`[type] 模型纠正题型 ${normalized.typeCorrected}（raw=${String(raw).slice(0, 40)}）`);
+    q.type = normalized.type;
+  }
   const rendered = renderAnswer(normalized, q);
 
   // 渲染出空串 = 模型给了越界下标之类无法映射的结果。别把空答案交给手机端

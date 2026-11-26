@@ -599,6 +599,149 @@ eq('超长文本不炸', (() => { try { parseScreen('长'.repeat(50000)); return
     kept.filter((t) => t.includes('上一题')).join('|'));
 }
 
+// ══════════════ 15. 多选题题型识别（第 5 题）══════════════
+// 真机数据（河南普法竞赛第 5 题，电竞酒店接待未成年人）。
+// 现象：多选题被判成单选，只给一个答案。
+//
+// 成因是我自己引入的回归：第 10 题为了裁掉顶部状态栏，用了
+//   cutLine = firstOptY - rowH × 3
+// 这种「固定行数」判据。第 10 题题干 3 行刚好躲过，第 5 题题干 4 行 ——
+// 裁剪线落进题干内部，把「多选题」（题型标签！）和「（多选）某电竞酒店…」
+// 两行切掉了。typeLabel 随之消失，detectType 退回「选项≥2 → single」，
+// 多选题就被判成单选。
+//
+// 修法：判据改用**行间距**。同一块内容内部行距 58~69px，
+// 「进度条 → 题干」之间 186~190px，差 3 倍，用 1.8×行高当阈值切断。
+// 另外必须先剔除「第一个选项自己的正文折行」—— 这题 A 的正文首行
+// （y=811）在标签（y=869）上方，不剔除的话 811→673 的 138px 会被当成
+// 跨块，回溯第一步就断，题干整块被删（实测 stem 变空串）。
+{
+  const boxes = [
+    // 状态栏 / 标题栏 / 进度条
+    { x: 721, y: 40,  x2: 770, y2: 74,  text: '676' },
+    { x: 608, y: 45,  x2: 680, y2: 79,  text: '2台' },
+    { x: 872, y: 45,  x2: 903, y2: 79,  text: '5G' },
+    { x: 142, y: 49,  x2: 222, y2: 83,  text: '1:34' },
+    { x: 718, y: 65,  x2: 767, y2: 99,  text: 'KB/s' },
+    { x: 150, y: 121, x2: 922, y2: 157, text: '河南省第四届“豫见法治”青少年学法...' },
+    { x: 439, y: 190, x2: 643, y2: 224, text: 'm.topnews.cn' },
+    { x: 239, y: 348, x2: 367, y2: 382, text: '05 /20' },
+    { x: 92,  y: 362, x2: 223, y2: 396, text: '答题进度' },
+    // 题干：4 行，第 1 行带题型词，第 2 行是题型标签（同一基线的两块）
+    { x: 292, y: 548, x2: 986, y2: 586, text: '（多选）某电竞酒店长期接待未成' },
+    { x: 117, y: 552, x2: 217, y2: 590, text: '多选题' },
+    { x: 93,  y: 611, x2: 986, y2: 649, text: '年人通宵上网，被查处。依据《未成年人保' },
+    { x: 93,  y: 673, x2: 700, y2: 711, text: '护法》，该酒店可能违反的义务包括？' },
+    // A：正文首行在标签上方（3 行正文）
+    { x: 180, y: 811, x2: 940, y2: 845, text: '接待未成年人入住时，依法询问其父母或者其' },
+    { x: 126, y: 869, x2: 940, y2: 903, text: 'A．他监护人的联系方式、入住人员身份关系等有' },
+    { x: 180, y: 925, x2: 560, y2: 959, text: '关情况的义务' },
+    // B / C / D
+    { x: 127, y: 1063, x2: 940, y2: 1097, text: 'B.遵守不适宜未成年人活动场所禁入规定的义务' },
+    { x: 177, y: 1199, x2: 800, y2: 1233, text: '承担对入住未成年人的临时监护职责' },
+    { x: 132, y: 1203, x2: 165, y2: 1237, text: 'C.' },
+    { x: 129, y: 1336, x2: 800, y2: 1370, text: 'D.学校对未成年学生的管理义务' },
+    { x: 241, y: 1584, x2: 379, y2: 1622, text: '上一题' },
+    { x: 706, y: 1586, x2: 843, y2: 1624, text: '下一题' },
+  ];
+  const rawText = boxes.map((b) => b.text).join('\n');
+
+  const r = parseScreen(rawText, { boxes });
+  eq('第5题：识别为多选', r.primary.type, 'multi');
+  eq('第5题：题型标签保留', r.primary.typeLabel, '多选题');
+  eq('第5题：4 个选项', r.primary.options.length, 4);
+
+  // 题干必须完整 —— 这是核心回归点，4 行一行都不能少
+  const stem = r.primary.stem;
+  ok('第5题：题干首行未被裁掉', stem.includes('某电竞酒店长期接待未成'), stem);
+  ok('第5题：题干中段保留', stem.includes('年人通宵上网'), stem);
+  ok('第5题：题干末行保留', stem.includes('该酒店可能违反的义务包括'), stem);
+
+  // 状态栏/进度条仍然要被切掉（不能为了保题干把噪声放进来）
+  ok('第5题：仍不含状态栏噪声',
+    !stem.includes('2台') && !stem.includes('KB/s'), stem);
+  ok('第5题：仍不含标题栏噪声',
+    !stem.includes('豫见法治') && !stem.includes('m.topnews.cn'), stem);
+  ok('第5题：仍不含进度条',
+    !stem.includes('答题进度') && !stem.includes('05 /20'), stem);
+
+  // A 的三行正文都要归到 A，不能因为首行在标签上方而丢失
+  ok('第5题：A 正文首行未丢',
+    r.primary.options[0].text.includes('接待未成年人入住时'), r.primary.options[0].text);
+  ok('第5题：A 正文末行已归并',
+    r.primary.options[0].text.includes('关情况的义务'), r.primary.options[0].text);
+
+  // C 是裸标签，要补回
+  eq('第5题：C 被补回', r.primary.options[2].key, 'C');
+  ok('第5题：C 正文完整',
+    r.primary.options[2].text.includes('承担对入住未成年人的临时监护职责'),
+    r.primary.options[2].text);
+}
+
+// ══════════════ 16. 题型自我纠正（模型说多选就是多选）══════════════
+// detectType 是从 OCR 文本猜题型的（找"多选题"标签、"包括哪些"线索），
+// OCR 漏字/版式特殊/题干被裁都会猜错。而 buildMessages 的 typeHint 是硬约束：
+// 猜成单选，模型就只能输出 {"index":N}。
+//
+// 更糟的是 parseAnswerText 原来写死 `type === 'multi' ? indices : selectedIndex`：
+// 即使模型主动返回 {"indices":[0,1]}，单选位置上也只取 indices[0]，
+// 多选题被硬砍成单选 —— 这是 air 反馈「经常检测不出来是多选」的直接原因。
+//
+// 现在的规则：模型返回多个下标 = 它认为答案不止一个，题型跟着改成 multi。
+// 只在单选/多选之间放行（判断/填空/简答格式不同，不能混）。
+{
+  const q = {
+    stem: '某电竞酒店长期接待未成年人通宵上网，该酒店可能违反的义务包括？',
+    options: [
+      { key: 'A', text: '依法询问监护人联系方式' },
+      { key: 'B', text: '遵守不适宜场所禁入规定' },
+      { key: 'C', text: '承担临时监护职责' },
+      { key: 'D', text: '学校的管理义务' },
+    ],
+    type: 'single',        // 故意给错的题型
+  };
+
+  // 模型返回多个下标 → 纠正为 multi，且两个答案都要保留
+  const n1 = parseAnswerText('{"indices":[0,1]}', q);
+  eq('纠正：题型改为 multi', n1.type, 'multi');
+  eq('纠正：记录了纠正来源', n1.typeCorrected, 'single→multi');
+  eq('纠正：两个下标都保留', JSON.parse(n1.params.indicesJson).join(','), '0,1');
+
+  // 模型只返回一个下标 → 维持单选，不能凭空升级成多选
+  const n2 = parseAnswerText('{"index":2}', q);
+  eq('不误升级：单选仍是 single', n2.type, 'single');
+  eq('不误升级：selectedIndex 正确', n2.params.selectedIndex, 2);
+  eq('不误升级：无纠正标记', n2.typeCorrected, undefined);
+
+  // 已经是 multi 的题，单下标也要按 multi 处理（渲染成 A 而不是丢）
+  const qm = { ...q, type: 'multi' };
+  const n3 = parseAnswerText('{"indices":[1]}', qm);
+  eq('多选单下标：仍是 multi', n3.type, 'multi');
+  eq('多选单下标：下标保留', JSON.parse(n3.params.indicesJson).join(','), '1');
+
+  // 判断题不能被多下标污染：它的语义是 index 0/1，格式完全不同
+  const qj = { stem: '下列说法正确。', options: [{ key: 'A', text: '对' }, { key: 'B', text: '错' }], type: 'judge' };
+  const n4 = parseAnswerText('{"indices":[0,1]}', qj);
+  ok('判断题不被升级成多选', n4.type === 'judge', n4.type);
+
+  // detectType 的文本线索（不依赖 typeLabel）
+  eq('detectType：括号多选', detectType({
+    stem: '（多选）某电竞酒店长期接待未成年人', options: q.options, type: null,
+  }), 'multi');
+  eq('detectType：包括哪些', detectType({
+    stem: '该酒店可能违反的义务包括哪些？', options: q.options, type: null,
+  }), 'multi');
+  eq('detectType：正确的有', detectType({
+    stem: '下列关于 TCP 的说法正确的有', options: q.options, type: null,
+  }), 'multi');
+  eq('detectType：哪一项是 → 单选', detectType({
+    stem: '下列关于 TCP 的说法哪一项是正确的', options: q.options, type: null,
+  }), 'single');
+  eq('detectType：普通单选', detectType({
+    stem: '第一次握手由谁发送 SYN 报文？', options: q.options, type: null,
+  }), 'single');
+}
+
 // ══════════════ 报告 ══════════════
 console.log(`\n${'='.repeat(60)}`);
 if (fail === 0) {

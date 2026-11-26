@@ -250,6 +250,21 @@ public final class AnswerOverlay {
             if (!type.isEmpty()) meta.append(" · ").append(labelType(type));
             if (m.ms > 0) meta.append(" · ").append(m.ms).append("ms");
             metaView.setText(meta.toString());
+
+            // 有答案时清掉状态行上的过期警告。
+            //
+            // 踩过的坑（真机截图）：第 10 题「只读到 2 个选项」的警告留在浮层上，
+            // 换到第 5 题答出正确结果后，答案区已经是「A …；B …」，
+            // 下面却还挂着「⚠ 只读到 2 个选项（应有 4 个）」—— 自相矛盾，
+            // 用户不知道该信哪个。
+            //
+            // 原因：status() 只在收到 status 消息时才改文本，而答案渲染走的是
+            // render()，两条路径互不相干。上一轮的警告没人清，就一直留着。
+            // 有答案 = 这一轮识别成功，之前的错误提示必然过期，直接复位。
+            if (hasAnswer && statusView != null) {
+                statusView.setText("a11y 已连接");
+                statusView.setTextColor(Color.parseColor("#CCFFFFFF"));
+            }
         } });
     }
 

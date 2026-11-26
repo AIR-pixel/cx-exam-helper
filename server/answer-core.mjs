@@ -280,12 +280,33 @@ export function detectType(q) {
   if (/\[填空\]|【填空】|填空题/.test(stem)) return 'blank';
 
   if (opts.length >= 2) {
-    // 多选题的经典线索：正确答案不止一个 / 少了某个选项
-    if (/\b(多选|下列.*正确的有|以下.*包括|正确的是)/.test(stem) &&
-        /有$|包括$|是$/.test(stem.replace(/\s+/g, ''))) {
-      // 只在题干带"有/包括"这种复数语义时判多选，仍存疑就交给 single
+    // ── 多选题的文本线索 ──
+    //
+    // 历史版本要求题干同时满足「含 多选/正确的有/包括」和「以 有/包括/是 结尾」，
+    // 两个条件都卡得很死，实战命中率很低：
+    //   第 5 题「…该酒店可能违反的义务包括？」结尾是问号不是"包括"，
+    //   第 284 行的 /有$|包括$|是$/ 直接不匹配 → 判成单选。
+    //
+    // 拆成几组独立判据，命中任一即可。按可靠性从高到低：
+    const flat = String(stem).replace(/\s+/g, '');
+
+    // (a) 题干里出现"（多选）""[多选]"这类显式标注 —— 最可靠。
+    //     OCR 常把它和题干正文粘在同一行，stripPrefix 只剥行首，粘在中间就漏。
+    if (/[（(【\[]\s*(多选|多选题|不定项|多项选择)\s*[)）】\]]/.test(flat)) return 'multi';
+
+    // (b) 复数语义的提问方式。"包括/有/哪些/几个/全部"都在问「不止一个」，
+    //     不要求出现在结尾 —— 中文问句结尾常是问号。
+    if (/(包括|有|是)(哪些|哪几|几个|多少)|哪些(是|属于|正确|符合)|全部(正确|符合|属于)的?/.test(flat)) {
       return 'multi';
     }
+
+    // (c) "下列说法正确的有" / "正确的是"（不带"哪一项"这种单数限定）
+    if (/下列.{0,12}(正确|符合|属于|成立)的(有|是)/.test(flat)) return 'multi';
+    //     但"下列说法正确的是"在中文里既可以单选也可以多选，只有在
+    //     同时出现"有"或复数提示时才判多选 —— 上面那条已经覆盖"的(有|是)"，
+    //     这里显式排除"哪一项/哪个"这种单数限定。
+    if (/哪(一|个)(项|个)?(是|正确|符合)/.test(flat)) return 'single';
+
     return 'single';
   }
   // 无选项：看有没有空位
@@ -481,7 +502,7 @@ export function recoverOptionsByGeometry(boxes) {
   }
   if (dropped.size) out = out.filter((_, i) => !dropped.has(i));
 
-  // ══════════ 第一遍半：按坐标裁掉顶部状态栏/标题栏 ══════════
+  // ══════════ 第一遍半：按坐标裁掉顶部状态栏/标题栏/进度条 ══════════
   //
   // 为什么必须放在「裸标签贴回」之后：裁剪要靠「第一个选项行的 y」定界，
   // 而裸标签没贴回之前，matchOption("A.") 返回 null（标签后无正文），
@@ -489,36 +510,82 @@ export function recoverOptionsByGeometry(boxes) {
   //
   // 为什么要按坐标裁：isOcrUiNoise 是按**文本内容**过滤的正则黑名单，只能
   // 挡住 "9:30"、"KB/s" 这类固定格式。状态栏的信号格数、通知图标、网页标题、
-  // 域名都读得出字但内容千变万化，黑名单挡不住。第 10 题实测混进题干的：
-  //   "2台"、"河南省第四届"豫见法治"青少年学法.."、"m.topnews.cn"、"① 00:23"
-  // 模型看到的是「2台 河南省…m.topnews.cn ① 00:23 答题进度 党的二十届…」
+  // 域名都读得出字但内容千变万化，黑名单挡不住。
   //
-  // 判据（三个都满足才删，避免误杀真题干）：
-  //   1. 在第一个选项上方
-  //   2. 离第一个选项超过 1.5 倍行高 —— 真题干紧贴选项，不会隔这么远
-  //   3. 落在「标题栏」区域内
+  // ── 判据用「行间距」，不是固定行数 ──
   //
-  // 关于第 3 条的边界怎么定：不能用 maxY2 × 0.2 估屏高。
-  // maxY2 是「最下面那个文字框」，这题是按钮 y2=1675，而真屏高 2400 ——
-  // 1675×0.2=335，进度条在 y=357 就「掉出顶部区」被当成题干留下了
-  // （实测：题干里混进 "① 00:23 答题进度"）。
+  // 一开始用 firstOptY - rowH×3 当裁剪线，结果第 5 题（多选题）题干有 4 行，
+  // 裁剪线落进了题干内部，把「多选题」和「（多选）某电竞酒店长期接待未成」
+  // 两行切掉了 —— 题干变成「护法》，该酒店可能违反的义务包括?」，
+  // 题型标签也跟着消失，多选题被判成单选。第 10 题题干 3 行刚好躲过，
+  // 所以当时没发现。**固定行数对题干长度不敏感，必然出问题。**
   //
-  // 改成从**第一个选项**反推：标题栏/进度条一定在「第一个选项上方一整段」，
-  // 而真题干就在选项正上方。用「第一个选项到它上方第一行的距离」当行高，
-  // 再乘以一个宽裕的倍数（3 倍）当分界 —— 真题干两行约 120px，
-  // 3 倍行高约 290px，标题栏在 750-357=393px 之外，正好被切掉。
+  // 稳定判据是行间距：同一块内容内部的行距约 58~69px（一行中文），
+  // 而「进度条 → 题干」之间隔着空白，间距 186~190px，差 3 倍。
+  // 所以从第一个选项往上逐行回溯，遇到明显变大的间距就切断：
+  //
+  //   第 5 题：选项811 ← 673 ← 611 ← 548 ┊ 362(进度条)
+  //            间距   138   62    63    ┊ 186  ← 在这里切断
+  //   第 10 题：选项750 ← 609 ← 608 ← 550 ┊ 360(进度条)
+  //            间距   141   1     58    ┊ 190  ← 在这里切断
+  //
+  // rowH 的取法：所有相邻 y 间隔中，落在 [30,100] 的那些的中位数。
+  // 不取最小值（第 10 题有 608→609 的 1px 间隔，同一行被切成两段），
+  // 不取全体中位数（16/4/0/5 这些状态栏碎片会把它拉低）。
   const preLabeled = out.filter((b) => matchOption(b.text));
   if (preLabeled.length >= 2) {
     const firstOptY = Math.min(...preLabeled.map((b) => b.y));
-    const gaps = [];
-    const sortedY = [...new Set(preLabeled.map((b) => b.y))].sort((a, b) => a - b);
-    for (let k = 1; k < sortedY.length; k++) gaps.push(sortedY[k] - sortedY[k - 1]);
-    const optGap = gaps.length ? Math.min(...gaps) : 140;
-    // 单行高 ≈ 选项间距的一半（选项之间夹着一行正文折行）
-    const rowH = Math.max(50, optGap / 2);
-    // 第一个选项往上，超过 3 个行高的都判为标题栏/进度条
-    const cutLine = firstOptY - rowH * 3;
-    out = out.filter((b) => b.y >= cutLine);
+
+    // 第一个选项上方，先剔除「属于第一个选项的正文折行」。
+    //
+    // 这一题的版式和第 10 题一样：正文在标签上方。
+    //   正文1 y=811  ← 这是 A 的正文首行，不是题干
+    //   标签A y=869
+    //   题干  y=673 / 611 / 552 / 548
+    // 不剔除的话，811→673 的 138px 间隔会被当成「跨块」，
+    // 回溯在第一步就断掉，题干整块被删（实测 stem 变成空串）。
+    //
+    // 判据：在第一个选项上方、且与它间距小于「一个选项间距」的行，
+    // 都属于第一个选项的正文（折行最多两三行，不会隔一个完整选项间距）。
+    const optGaps = [];
+    const sortedOptY = [...new Set(preLabeled.map((b) => b.y))].sort((a, b) => a - b);
+    for (let k = 1; k < sortedOptY.length; k++) optGaps.push(sortedOptY[k] - sortedOptY[k - 1]);
+    const optGap = optGaps.length ? Math.min(...optGaps) : 140;
+
+    const above = out
+      .filter((b) => b.y < firstOptY)
+      // 排除第一个选项自己的正文折行（离它不足一个选项间距）
+      .filter((b) => firstOptY - b.y > optGap)
+      .sort((a, b) => b.y - a.y);
+
+    if (above.length) {
+      // 用「一行文字」的典型高度当基准：取 [30,100] 区间内间隔的中位数
+      const rowGaps = [];
+      for (let k = 1; k < above.length; k++) {
+        const d = above[k - 1].y - above[k].y;
+        if (d >= 30 && d <= 100) rowGaps.push(d);
+      }
+      rowGaps.sort((a, b) => a - b);
+      const rowH = rowGaps.length
+        ? rowGaps[Math.floor(rowGaps.length / 2)]
+        : 60;
+      // 超过 1.8 倍行高就是跨块（进度条/标题栏），从这里往上全部丢掉
+      const breakGap = rowH * 1.8;
+
+      let cutAt = above.length;        // 默认：全都保留（above 里全是题干）
+      for (let k = 1; k < above.length; k++) {
+        const gap = above[k - 1].y - above[k].y;
+        if (gap > breakGap) { cutAt = k; break; }
+      }
+      // above 从下往上排，前 cutAt 个是「紧贴选项的题干块」。
+      // 注意还要把「第一个选项自己的正文折行」放回来（它们刚才被排除了）。
+      const keepSet = new Set(above.slice(0, cutAt).map((b) => `${b.y}:${b.x}`));
+      out = out.filter((b) => {
+        if (b.y >= firstOptY) return true;                    // 选项及以下全留
+        if (firstOptY - b.y <= optGap) return true;           // 第一个选项的正文折行
+        return keepSet.has(`${b.y}:${b.x}`);                  // 保留下来的题干块
+      });
+    }
   }
 
   // 只处理「有选项标签」的行：先算出正常选项的正文左边界基准
@@ -990,12 +1057,35 @@ export function parseAnswerText(aiText, q) {
     }
     if (j.indices || j.index != null) {
       const idx = Array.isArray(j.indices) ? j.indices : [j.index];
+      const nums = idx.map(Number).filter((n) => Number.isInteger(n) && n >= 0);
+
+      // ── 题型自我纠正 ──
+      //
+      // 原来这里写死了 `type === 'multi' ? indices : selectedIndex`：
+      // detectType 一旦把多选题判成单选，模型即使返回 {"indices":[0,1]}
+      // 也只会取 indices[0]，剩下的全部丢弃 —— 多选题被硬砍成单选。
+      // air 反馈的「经常检测不出来是多选，给的答案还是单选」就是这个。
+      //
+      // 现在的规则：模型明确返回了**多个**下标，就说明它认为答案不止一个。
+      // 只有单选/多选之间允许这样纠正（判断/填空/简答的格式不同，不混）。
+      // 单选位置上收到多下标时，题型跟着改成 multi，而不是砍掉多余的。
+      const wantMulti = type === 'multi'
+        || ((type === 'single') && nums.length > 1);
+      if (wantMulti && nums.length > 1) {
+        return {
+          mode: 'json',
+          type: 'multi',
+          params: { indicesJson: JSON.stringify(nums) },
+          raw,
+          typeCorrected: type !== 'multi' ? `${type}→multi` : undefined,
+        };
+      }
       return {
         mode: 'json',
         type,
-        params: type === 'multi'
-          ? { indicesJson: JSON.stringify(idx.map(Number)) }
-          : { selectedIndex: Number(idx[0]) },
+        params: wantMulti
+          ? { indicesJson: JSON.stringify(nums) }
+          : { selectedIndex: nums[0] },
         raw,
       };
     }
