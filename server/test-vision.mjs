@@ -370,6 +370,50 @@ t('vision=only 失败时不退回 OCR', () => {
   assert.ok(seg.includes("source: 'error'"), 'only 失败要明确报错，不能静默退回');
 });
 
+console.log('\n=== 13. 视觉默认开启（air 反馈第 1 题又只读到 2 选项）===');
+// 上一版把 VISION_MODE 默认设成 off，结果用户按 Vol+×2（fast）走的还是 OCR，
+// 以为已经换成视觉了，实际照样踩「只读到 2 个选项」。实测第 1 题：
+//   OCR 路径  5142ms  opts=2（C/D 丢失）  source=none 只有警告
+//   视觉路径  5245ms  opts=4 齐全          source=vision 答出 A+B+C
+// 延迟几乎一样，没有理由不选准的那个。所以默认改成 first。
+
+t('服务端默认 VISION_MODE 必须是 first', () => {
+  const i = src.indexOf("process.env.VISION_MODE || 'first'");
+  assert.ok(i > 0, "必须默认 'first'，否则不带 vision 参数的请求（Vol+×2）走不到视觉");
+});
+
+t('manager 默认 visionMode 必须是 first', async () => {
+  const mgr = await import('node:fs').then((fs) =>
+    fs.readFileSync(new URL('./manager.mjs', import.meta.url), 'utf8'));
+  const m = mgr.match(/visionMode:\s*'(\w+)'/);
+  assert.ok(m, 'manager 里必须有 visionMode 默认值');
+  assert.equal(m[1], 'first', `manager 默认是 ${m[1]}，应为 first`);
+});
+
+t('manager 把 visionMode 传给子进程', async () => {
+  const mgr = await import('node:fs').then((fs) =>
+    fs.readFileSync(new URL('./manager.mjs', import.meta.url), 'utf8'));
+  assert.ok(mgr.includes('env.VISION_MODE = config.visionMode'),
+    '不传的话子进程只能吃默认值，改配置不生效');
+});
+
+t('视觉解析失败要重试一次', () => {
+  // 退回 OCR 的代价很大（第 1 题 OCR 只读到 2 选项，直接答不了），
+  // 而视觉重试一次通常就对了。多花 5s 换一个能用的答案划算。
+  assert.ok(src.includes('第一次解析失败'), '必须有重试逻辑');
+  const i = src.indexOf('第一次解析失败');
+  const seg = src.slice(i, i + 300);
+  assert.ok(seg.includes('engineQoderVisionFull'), '重试必须再调一次视觉');
+});
+
+t('fast 档走视觉时用快模型', () => {
+  // 视觉慢主要是模型端推理，mmodel 比 dfmodel 快 1~2s，这个任务上效果没差别
+  const i = src.indexOf('async function engineQoderVisionFull');
+  const seg = src.slice(i, i + 2200);
+  assert.ok(seg.includes('QODER_FAST_MODEL'), 'fast 档必须能换快模型');
+  assert.ok(seg.includes('reasoningEffort'), 'fast 档必须能降思考深度');
+});
+
 console.log('\n' + '='.repeat(56));
 if (fail === 0) console.log(`PASS  ${pass} 项通过，全部`);
 else console.log(`FAIL  ${pass} 通过 / ${fail} 失败`);

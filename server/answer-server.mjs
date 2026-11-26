@@ -294,7 +294,7 @@ async function engineQoderVision(q, image) {
  *   · 浮层能显示选项原文（用户能核对是不是这一题）
  *   · indices 直接映射字母，不需要几何恢复
  */
-async function engineQoderVisionFull(image) {
+async function engineQoderVisionFull(image, fast = false) {
   const b64 = await imageToBase64(image);
   if (!b64) throw new Error('图片解码失败');
   if (b64.startsWith('__SVG__')) throw new Error('SVG 走文本抽取，不需要视觉');
@@ -324,8 +324,13 @@ async function engineQoderVisionFull(image) {
       { role: 'user', content: '看这张截图，作答。' },
     ],
     {
-      model: process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel',
+      // fast 档用快模型 + 浅思考。视觉路径慢主要是模型端推理，不是传图 ——
+      // 实测同一张图 mmodel 比 dfmodel 快 1~2s，效果在这个任务上没差别。
+      model: fast
+        ? (process.env.QODER_FAST_MODEL || 'mmodel')
+        : (process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel'),
       images: [url],
+      ...(fast ? { reasoningEffort: process.env.QODER_FAST_EFFORT || 'minimal' } : {}),
       timeoutMs: Number(process.env.ANSWER_VL_TIMEOUT_MS || 90000),
     },
   );
@@ -1279,19 +1284,34 @@ const server = http.createServer(async (req, res) => {
       // 每遇到一种新排版就踩一个坑（第 7/10/5 题各一个），而且修 A 会踩坏 B。
       // 实测三道踩过坑的题，纯视觉全部一次答对，题干还更完整。
       //
-      // 但默认仍是 off —— 视觉一张 330KB 图要 5~11s，比 OCR 贵也慢；
+      // 但默认仍是 first —— 视觉一张 330KB 图要 5~11s，比 OCR 贵也慢；
       // OCR 在标准版式上 7s 就能出结果。用 AIR 的按钮决定：
-      //   · off    （默认）OCR 优先，OCR 判不出才走视觉（原行为）
-      //   · first  视觉优先，失败才退回 OCR 路径
+      //   · off    OCR 优先，OCR 判不出才走视觉（原行为）
+      //   · first  （默认）视觉优先，失败才退回 OCR 路径
       //   · only   只走视觉，不碰 OCR
       //
       // 手机端可以按请求传 vision:"first"/"only" 覆盖，方便对比实测。
-      const visionMode = (reqVision || process.env.VISION_MODE || 'off').toLowerCase();
+      const visionMode = (reqVision || process.env.VISION_MODE || 'first').toLowerCase();
       if (image && visionMode !== 'off' && (engineMode === 'qoder' || engineMode === 'auto')) {
         try {
-          console.log(`[vision-first] 整屏交给模型 model=${process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel'}`);
-          const vraw = await engineQoderVisionFull(image);
-          const v = parseVisionFull(vraw);
+          console.log(`[vision-first] 整屏交给模型 model=${fast
+            ? (process.env.QODER_FAST_MODEL || 'mmodel')
+            : (process.env.QODER_VL_MODEL || process.env.QODER_MODEL || 'dfmodel')} fast=${fast}`);
+          let vraw = await engineQoderVisionFull(image, fast);
+          let v = parseVisionFull(vraw);
+
+          // 解析失败重试一次。
+          //
+          // 为什么值得重试：退回 OCR 的代价很大 —— 第 1 题 OCR 只读到 2 个选项
+          // （C/D 丢了），直接答不了；而视觉重试一次通常就对了（模型偶尔会
+          // 返回带解释的文本而不是纯 JSON）。多花 5s 换一个能用的答案，
+          // 比立刻退回一条注定失败的路径划算。
+          if (!v.ok) {
+            console.warn(`[vision-first] 第一次解析失败（${v.reason}），重试一次`);
+            vraw = await engineQoderVisionFull(image, fast);
+            v = parseVisionFull(vraw);
+          }
+
           if (v.ok) {
             const vq = {
               stem: v.stem,
